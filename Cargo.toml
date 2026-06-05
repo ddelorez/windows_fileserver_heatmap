@@ -1,0 +1,15 @@
+[package]
+name = "smb-heat-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Correlation-engine spike: resolve SMBServer ETW opens to (user, share, path)"
+
+# Windows-only: this binary opens a real-time ETW session and only builds/runs on Windows.
+[dependencies]
+ferrisetw = "1.1"   # VERIFY: pin to the version actually on your dev VM; the ETW
+                    # session API in src/etw.rs is the thing most likely to need a
+                    # small tweak to match the pinned version's examples.
+
+[profile.release]
+opt-level = 3
+lto = true
