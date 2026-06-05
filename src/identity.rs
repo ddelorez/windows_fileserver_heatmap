@@ -24,6 +24,19 @@ impl PrincipalClass {
     }
 }
 
+/// Compose a `DOMAIN\name` principal from the separate `DomainName` /
+/// `UserName` fields an SMB session-auth (552) event carries. Either part may
+/// be absent (some logons omit the domain), so we produce the most specific
+/// string available; the result is what `classify` then consumes.
+pub fn compose(domain: &str, user: &str) -> String {
+    match (domain.is_empty(), user.is_empty()) {
+        (false, false) => format!("{domain}\\{user}"),
+        (true, false) => user.to_string(),
+        (false, true) => domain.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
 /// Classify an account string. Accepts `DOMAIN\name`, bare `name`, or a SID
 /// string (`S-1-5-...`). Service-account detection beyond the built-in
 /// well-knowns is intentionally config-driven in the real agent (a site has its
@@ -91,5 +104,14 @@ mod tests {
     fn unknown_is_not_automation() {
         assert_eq!(classify(""), PrincipalClass::Unknown);
         assert!(!classify("").is_automation());
+    }
+
+    #[test]
+    fn compose_builds_domain_qualified_principal() {
+        assert_eq!(compose("CONTOSO", "alice"), "CONTOSO\\alice");
+        assert_eq!(compose("", "alice"), "alice");
+        assert_eq!(compose("CONTOSO", ""), "CONTOSO");
+        // Composition feeds classification unchanged.
+        assert_eq!(classify(&compose("CONTOSO", "SGIFS01$")), PrincipalClass::Machine);
     }
 }

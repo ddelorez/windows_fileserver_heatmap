@@ -1,14 +1,17 @@
 //! SMBServer provider constants, the normalized event enum, and the property
 //! extraction adapter.
 //!
-//! Everything in the "facts" section below is taken straight from the provider
+//! Everything in the "FACTS" section is taken straight from the provider
 //! manifest (`wevtutil gp Microsoft-Windows-SMBServer /ge /gm:true`) on a live
-//! server, so it's solid. Everything in the "VERIFY" section is a *guess* at the
-//! ETW property names, because the message-less Analytic events (552/600/650)
-//! don't render a template in the manifest. Run `smb-heat-spike discover` first;
-//! it prints the field names that actually parse, and you fix the arrays here.
+//! server. The "SCHEMA" section property names + types were extracted from the
+//! provider event templates (`Get-WinEvent ... | %{ $_.Template }`) and
+//! confirmed against a Stage-1 live capture. The headline finding: the
+//! correlation keys are per-object **GUIDs** (ConnectionGUID / SessionGUID /
+//! TreeConnectGUID), not integer ids — which is why the earlier integer probes
+//! resolved nothing.
 
 use ferrisetw::parser::Parser;
+use ferrisetw::GUID;
 
 // ---------------------------------------------------------------------------
 // FACTS (from the manifest — high confidence)
@@ -55,30 +58,79 @@ pub const DISCOVER_TARGETS: &[u16] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// VERIFY (property names — confirm with `discover`, then trim each list to the
-// single name that actually parses)
+// Correlation key
 // ---------------------------------------------------------------------------
-pub const P_CONN_ID: &[&str] = &["ConnectionId", "ConnId", "Connection"];
-pub const P_SESSION_ID: &[&str] = &["SessionId", "SmbSessionId", "SessId"];
-pub const P_TREE_ID: &[&str] = &["TreeConnectId", "TreeId", "TreeConnect"];
-pub const P_USER_NAME: &[&str] = &["UserName", "User", "Account", "AccountName"];
-pub const P_USER_SID: &[&str] = &["UserSid", "Sid", "SidString", "SecurityId"];
-pub const P_SHARE_NAME: &[&str] = &["ShareName", "Share"];
-pub const P_FILE_NAME: &[&str] = &["FileName", "Name", "RelativeTargetName", "FilePath"];
-pub const P_CLIENT_ADDR: &[&str] = &["ClientAddress", "Address", "ClientName"];
+
+/// A normalized, hashable correlation key.
+///
+/// SMB lifecycle objects are identified by 128-bit GUIDs (`win:GUID` template
+/// fields). We fold each GUID into a `u128` so the engine's tables key on a
+/// cheap `Copy` type and the unit tests can use plain integer literals.
+pub type GuidKey = u128;
+
+/// Fold a windows `GUID` into our canonical `u128` key. Field order is
+/// big-endian (data1 in the high bits) so `fmt_guid_key` can render it back in
+/// the usual textual form.
+pub fn guid_key(g: GUID) -> GuidKey {
+    ((g.data1 as u128) << 96)
+        | ((g.data2 as u128) << 80)
+        | ((g.data3 as u128) << 64)
+        | (u64::from_be_bytes(g.data4) as u128)
+}
+
+/// Render a `GuidKey` back to the canonical
+/// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` textual form.
+pub fn fmt_guid_key(k: GuidKey) -> String {
+    let d1 = (k >> 96) as u32;
+    let d2 = (k >> 80) as u16;
+    let d3 = (k >> 64) as u16;
+    let d4 = (k as u64).to_be_bytes();
+    format!(
+        "{d1:08X}-{d2:04X}-{d3:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    )
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA (property names + types — from the provider templates, confirmed live)
+//
+//   500 ConnAccept : ConnectionGUID(GUID), Address(SocketAddress), TransportName(str)
+//   550 SessAlloc  : SessionGUID(GUID), ConnectionGUID(GUID)
+//   552 SessAuth   : SessionGUID(GUID), ConnectionGUID(GUID), UserName(str), DomainName(str)
+//   600 TreeConn   : TreeConnectGUID(GUID), SessionGUID(GUID), ConnectionGUID(GUID),
+//                    ShareGUID(GUID), ShareName(str), ScopeName(str)
+//   650 Open       : OpenGUID(GUID), TreeConnectGUID(GUID), SessionGUID(GUID),
+//                    ConnectionGUID(GUID), ShareGUID(GUID), Name(str), DesiredAccess(u32)
+//
+// UserName / ShareName / Name are counted strings that already parse by name as
+// String — we deliberately do NOT read the matching *Length fields by hand.
+// ---------------------------------------------------------------------------
+pub const P_CONN_GUID: &[&str] = &["ConnectionGUID"];
+pub const P_SESSION_GUID: &[&str] = &["SessionGUID"];
+pub const P_TREE_GUID: &[&str] = &["TreeConnectGUID"];
+pub const P_SHARE_GUID: &[&str] = &["ShareGUID"];
+pub const P_OPEN_GUID: &[&str] = &["OpenGUID"];
+pub const P_USER_NAME: &[&str] = &["UserName"];
+pub const P_DOMAIN_NAME: &[&str] = &["DomainName"];
+pub const P_SHARE_NAME: &[&str] = &["ShareName"];
+pub const P_SCOPE_NAME: &[&str] = &["ScopeName"];
+pub const P_FILE_NAME: &[&str] = &["Name"];
+pub const P_ADDRESS: &[&str] = &["Address"];
+pub const P_TRANSPORT: &[&str] = &["TransportName"];
+pub const P_DESIRED_ACCESS: &[&str] = &["DesiredAccess"];
 
 // ---------------------------------------------------------------------------
 // Normalized event — decouples the engine from ETW parsing.
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub enum SmbEvent {
-    ConnAccept { conn_id: u64, client: String },
-    ConnEnd { conn_id: u64 },
-    SessionAuth { session_id: u64, conn_id: Option<u64>, user: String },
-    SessionEnd { session_id: u64 },
-    TreeConnect { tree_id: u64, session_id: u64, share: String },
-    TreeEnd { tree_id: u64 },
-    Open { session_id: Option<u64>, tree_id: Option<u64>, path: String },
+    ConnAccept { conn: GuidKey, client: String },
+    ConnEnd { conn: GuidKey },
+    SessionAuth { session: GuidKey, conn: Option<GuidKey>, user: String, domain: String },
+    SessionEnd { session: GuidKey },
+    TreeConnect { tree: GuidKey, session: GuidKey, share: String },
+    TreeEnd { tree: GuidKey },
+    Open { session: Option<GuidKey>, tree: Option<GuidKey>, path: String, access: u32 },
 }
 
 /// Try each candidate name as a string property; return the first that parses.
@@ -91,8 +143,20 @@ pub fn first_str(parser: &Parser, names: &[&str]) -> Option<String> {
     None
 }
 
-/// Try each candidate name as an integer property; widen across widths because
-/// SessionId is 64-bit, TreeId 32-bit, etc., and we normalize to u64.
+/// Try each candidate name as a `win:GUID` property and normalize it to a
+/// `GuidKey`. This is the parse type ferrisetw 1.2.0 exposes for GUID fields
+/// (`Parser::try_parse::<ferrisetw::GUID>`); it enforces `InTypeGuid`.
+pub fn first_guid(parser: &Parser, names: &[&str]) -> Option<GuidKey> {
+    for n in names {
+        if let Ok(g) = parser.try_parse::<GUID>(n) {
+            return Some(guid_key(g));
+        }
+    }
+    None
+}
+
+/// Try each candidate name as an unsigned integer; widen across widths because
+/// some masks are 32-bit and we normalize to u64 at the call site.
 pub fn first_u64(parser: &Parser, names: &[&str]) -> Option<u64> {
     for n in names {
         if let Ok(v) = parser.try_parse::<u64>(n) {
@@ -108,39 +172,76 @@ pub fn first_u64(parser: &Parser, names: &[&str]) -> Option<u64> {
     None
 }
 
+/// Try each candidate name as a `win:SocketAddress`.
+///
+/// ferrisetw 1.2.0 has no `SocketAddress` parser (and its `IpAddr` impl rejects
+/// the SocketAddress out-type), so we pull the raw `SOCKADDR` bytes via the
+/// `Vec<u8>` parse and decode them ourselves. NOTE: the SOCKADDR layout decode
+/// below is the one part of this change that still needs confirmation against a
+/// live 500 event.
+pub fn first_socket_addr(parser: &Parser, names: &[&str]) -> Option<String> {
+    for n in names {
+        if let Ok(bytes) = parser.try_parse::<Vec<u8>>(n) {
+            return Some(decode_socket_address(&bytes));
+        }
+    }
+    None
+}
+
+/// Decode a Windows `SOCKADDR` blob to a bare IP string (port discarded — we
+/// only want the client address for attribution). Falls back to hex so nothing
+/// is dropped silently if the family is unrecognized.
+pub fn decode_socket_address(b: &[u8]) -> String {
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 23;
+    match b.get(0..2).map(|f| u16::from_le_bytes([f[0], f[1]])) {
+        // sockaddr_in:  family(2) port(2) addr(4)
+        Some(AF_INET) if b.len() >= 8 => {
+            std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]).to_string()
+        }
+        // sockaddr_in6: family(2) port(2) flowinfo(4) addr(16) scope(4)
+        Some(AF_INET6) if b.len() >= 24 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&b[8..24]);
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => b.iter().map(|x| format!("{x:02x}")).collect(),
+    }
+}
+
 /// Map a raw event to a normalized `SmbEvent`. Returns `None` for ids we don't
 /// model or when a required key is missing (the spike just skips those).
 pub fn parse_event(event_id: u16, parser: &Parser) -> Option<SmbEvent> {
     match event_id {
         E_CONN_ACCEPT => Some(SmbEvent::ConnAccept {
-            conn_id: first_u64(parser, P_CONN_ID)?,
-            client: first_str(parser, P_CLIENT_ADDR).unwrap_or_default(),
+            conn: first_guid(parser, P_CONN_GUID)?,
+            client: first_socket_addr(parser, P_ADDRESS).unwrap_or_default(),
         }),
         E_CONN_DISC | E_CONN_TERM => Some(SmbEvent::ConnEnd {
-            conn_id: first_u64(parser, P_CONN_ID)?,
+            conn: first_guid(parser, P_CONN_GUID)?,
         }),
         E_SESS_AUTH => Some(SmbEvent::SessionAuth {
-            session_id: first_u64(parser, P_SESSION_ID)?,
-            conn_id: first_u64(parser, P_CONN_ID),
-            user: first_str(parser, P_USER_NAME)
-                .or_else(|| first_str(parser, P_USER_SID))
-                .unwrap_or_else(|| "<unknown>".into()),
+            session: first_guid(parser, P_SESSION_GUID)?,
+            conn: first_guid(parser, P_CONN_GUID),
+            user: first_str(parser, P_USER_NAME).unwrap_or_default(),
+            domain: first_str(parser, P_DOMAIN_NAME).unwrap_or_default(),
         }),
         E_SESS_TERM | E_SESS_CLOSE => Some(SmbEvent::SessionEnd {
-            session_id: first_u64(parser, P_SESSION_ID)?,
+            session: first_guid(parser, P_SESSION_GUID)?,
         }),
         E_TREE_ALLOC => Some(SmbEvent::TreeConnect {
-            tree_id: first_u64(parser, P_TREE_ID)?,
-            session_id: first_u64(parser, P_SESSION_ID).unwrap_or(0),
+            tree: first_guid(parser, P_TREE_GUID)?,
+            session: first_guid(parser, P_SESSION_GUID).unwrap_or(0),
             share: first_str(parser, P_SHARE_NAME).unwrap_or_default(),
         }),
         E_TREE_DISC | E_TREE_TERM => Some(SmbEvent::TreeEnd {
-            tree_id: first_u64(parser, P_TREE_ID)?,
+            tree: first_guid(parser, P_TREE_GUID)?,
         }),
         E_OPEN => Some(SmbEvent::Open {
-            session_id: first_u64(parser, P_SESSION_ID),
-            tree_id: first_u64(parser, P_TREE_ID),
+            session: first_guid(parser, P_SESSION_GUID),
+            tree: first_guid(parser, P_TREE_GUID),
             path: first_str(parser, P_FILE_NAME).unwrap_or_default(),
+            access: first_u64(parser, P_DESIRED_ACCESS).unwrap_or(0) as u32,
         }),
         _ => None,
     }

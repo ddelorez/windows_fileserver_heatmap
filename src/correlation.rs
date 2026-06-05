@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::events::SmbEvent;
+use crate::events::{fmt_guid_key, GuidKey, SmbEvent};
 use crate::identity::{self, PrincipalClass};
 
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ struct SessionInfo {
 
 #[derive(Debug, Clone)]
 struct TreeInfo {
-    session_id: u64,
+    session: GuidKey,
     share: String,
 }
 
@@ -37,31 +37,33 @@ pub struct ResolvedAccess {
     pub client: Option<String>,
     pub share: String,
     pub path: String,
-    pub session_id: u64,
-    pub tree_id: u64,
+    pub session: GuidKey,
+    pub tree: GuidKey,
+    pub access: u32,
 }
 
 impl std::fmt::Display for ResolvedAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[{:?}] {} @ {} | {}{}  (sess {}, tree {})",
+            "[{:?}] {} @ {} | {}\\{}  (sess {}, tree {}) access=0x{:08X}",
             self.class,
             self.user,
             self.client.as_deref().unwrap_or("?"),
             self.share,
             self.path,
-            self.session_id,
-            self.tree_id
+            fmt_guid_key(self.session),
+            fmt_guid_key(self.tree),
+            self.access,
         )
     }
 }
 
 #[derive(Default)]
 pub struct CorrelationEngine {
-    conns: HashMap<u64, ConnInfo>,
-    sessions: HashMap<u64, SessionInfo>,
-    trees: HashMap<u64, TreeInfo>,
+    conns: HashMap<GuidKey, ConnInfo>,
+    sessions: HashMap<GuidKey, SessionInfo>,
+    trees: HashMap<GuidKey, TreeInfo>,
 
     // Spike metrics — the resolved/unresolved ratio is how you judge success.
     pub opens_total: u64,
@@ -74,39 +76,42 @@ impl CorrelationEngine {
     /// resolves to a user.
     pub fn apply(&mut self, ev: &SmbEvent) -> Option<ResolvedAccess> {
         match ev {
-            SmbEvent::ConnAccept { conn_id, client } => {
-                self.conns.insert(*conn_id, ConnInfo { client: client.clone() });
+            SmbEvent::ConnAccept { conn, client } => {
+                self.conns.insert(*conn, ConnInfo { client: client.clone() });
                 None
             }
-            SmbEvent::ConnEnd { conn_id } => {
-                self.conns.remove(conn_id);
+            SmbEvent::ConnEnd { conn } => {
+                self.conns.remove(conn);
                 None
             }
-            SmbEvent::SessionAuth { session_id, conn_id, user } => {
-                let client = conn_id
+            SmbEvent::SessionAuth { session, conn, user, domain } => {
+                let client = conn
                     .and_then(|c| self.conns.get(&c))
                     .map(|c| c.client.clone());
+                // Compose DOMAIN\user before storing so classification (and the
+                // resolved output) see the full principal.
+                let principal = identity::compose(domain, user);
                 self.sessions
-                    .insert(*session_id, SessionInfo { user: user.clone(), client });
+                    .insert(*session, SessionInfo { user: principal, client });
                 None
             }
-            SmbEvent::SessionEnd { session_id } => {
-                self.sessions.remove(session_id);
+            SmbEvent::SessionEnd { session } => {
+                self.sessions.remove(session);
                 None
             }
-            SmbEvent::TreeConnect { tree_id, session_id, share } => {
+            SmbEvent::TreeConnect { tree, session, share } => {
                 self.trees.insert(
-                    *tree_id,
-                    TreeInfo { session_id: *session_id, share: share.clone() },
+                    *tree,
+                    TreeInfo { session: *session, share: share.clone() },
                 );
                 None
             }
-            SmbEvent::TreeEnd { tree_id } => {
-                self.trees.remove(tree_id);
+            SmbEvent::TreeEnd { tree } => {
+                self.trees.remove(tree);
                 None
             }
-            SmbEvent::Open { session_id, tree_id, path } => {
-                self.resolve(*session_id, *tree_id, path)
+            SmbEvent::Open { session, tree, path, access } => {
+                self.resolve(*session, *tree, path, *access)
             }
         }
     }
@@ -116,17 +121,18 @@ impl CorrelationEngine {
     /// session id carried directly on the open if the tree isn't known yet.
     fn resolve(
         &mut self,
-        session_id: Option<u64>,
-        tree_id: Option<u64>,
+        session: Option<GuidKey>,
+        tree: Option<GuidKey>,
         path: &str,
+        access: u32,
     ) -> Option<ResolvedAccess> {
         self.opens_total += 1;
 
-        let (sess_from_tree, share) = match tree_id.and_then(|t| self.trees.get(&t)) {
-            Some(t) => (Some(t.session_id), Some(t.share.clone())),
+        let (sess_from_tree, share) = match tree.and_then(|t| self.trees.get(&t)) {
+            Some(t) => (Some(t.session), Some(t.share.clone())),
             None => (None, None),
         };
-        let sess = sess_from_tree.or(session_id);
+        let sess = sess_from_tree.or(session);
 
         match sess.and_then(|s| self.sessions.get(&s)) {
             Some(si) => {
@@ -137,8 +143,9 @@ impl CorrelationEngine {
                     client: si.client.clone(),
                     share: share.unwrap_or_else(|| "<unresolved-share>".into()),
                     path: path.to_string(),
-                    session_id: sess.unwrap_or(0),
-                    tree_id: tree_id.unwrap_or(0),
+                    session: sess.unwrap_or(0),
+                    tree: tree.unwrap_or(0),
+                    access,
                 })
             }
             None => {
@@ -167,10 +174,18 @@ impl CorrelationEngine {
 mod tests {
     use super::*;
 
+    // The keys are GUIDs in production; the engine treats them as opaque u128
+    // `GuidKey`s, so the fixtures use plain integer literals as stand-in GUIDs.
+    const CONN_A: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0001;
+    const SESS_A: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0100;
+    const TREE_A: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0010;
+    const SESS_B: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0200;
+    const TREE_B: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0020;
+
     fn seed_human(e: &mut CorrelationEngine) {
-        e.apply(&SmbEvent::ConnAccept { conn_id: 1, client: "10.0.0.5".into() });
-        e.apply(&SmbEvent::SessionAuth { session_id: 100, conn_id: Some(1), user: "CONTOSO\\alice".into() });
-        e.apply(&SmbEvent::TreeConnect { tree_id: 10, session_id: 100, share: "DATA".into() });
+        e.apply(&SmbEvent::ConnAccept { conn: CONN_A, client: "10.0.0.5".into() });
+        e.apply(&SmbEvent::SessionAuth { session: SESS_A, conn: Some(CONN_A), user: "alice".into(), domain: "CONTOSO".into() });
+        e.apply(&SmbEvent::TreeConnect { tree: TREE_A, session: SESS_A, share: "DATA".into() });
     }
 
     #[test]
@@ -179,9 +194,10 @@ mod tests {
         seed_human(&mut e);
         let r = e
             .apply(&SmbEvent::Open {
-                session_id: Some(100),
-                tree_id: Some(10),
+                session: Some(SESS_A),
+                tree: Some(TREE_A),
                 path: "\\projects\\q3.xlsx".into(),
+                access: 0x0012_0089,
             })
             .expect("should resolve");
         assert_eq!(r.user, "CONTOSO\\alice");
@@ -197,7 +213,7 @@ mod tests {
         let mut e = CorrelationEngine::default();
         seed_human(&mut e);
         let r = e
-            .apply(&SmbEvent::Open { session_id: None, tree_id: Some(10), path: "x".into() })
+            .apply(&SmbEvent::Open { session: None, tree: Some(TREE_A), path: "x".into(), access: 0 })
             .expect("tree should carry the session");
         assert_eq!(r.user, "CONTOSO\\alice");
         assert_eq!(r.share, "DATA");
@@ -206,10 +222,10 @@ mod tests {
     #[test]
     fn machine_account_is_tagged() {
         let mut e = CorrelationEngine::default();
-        e.apply(&SmbEvent::SessionAuth { session_id: 200, conn_id: None, user: "CONTOSO\\SGIFS01$".into() });
-        e.apply(&SmbEvent::TreeConnect { tree_id: 20, session_id: 200, share: "DATA".into() });
+        e.apply(&SmbEvent::SessionAuth { session: SESS_B, conn: None, user: "SGIFS01$".into(), domain: "CONTOSO".into() });
+        e.apply(&SmbEvent::TreeConnect { tree: TREE_B, session: SESS_B, share: "DATA".into() });
         let r = e
-            .apply(&SmbEvent::Open { session_id: Some(200), tree_id: Some(20), path: "y".into() })
+            .apply(&SmbEvent::Open { session: Some(SESS_B), tree: Some(TREE_B), path: "y".into(), access: 0 })
             .unwrap();
         assert_eq!(r.class, PrincipalClass::Machine);
         assert!(r.class.is_automation());
@@ -218,7 +234,7 @@ mod tests {
     #[test]
     fn cold_start_open_is_unresolved_not_panicking() {
         let mut e = CorrelationEngine::default();
-        let r = e.apply(&SmbEvent::Open { session_id: Some(999), tree_id: Some(999), path: "z".into() });
+        let r = e.apply(&SmbEvent::Open { session: Some(0xDEAD), tree: Some(0xBEEF), path: "z".into(), access: 0 });
         assert!(r.is_none());
         assert_eq!(e.opens_unresolved, 1);
     }
@@ -227,9 +243,9 @@ mod tests {
     fn teardown_removes_state() {
         let mut e = CorrelationEngine::default();
         seed_human(&mut e);
-        e.apply(&SmbEvent::SessionEnd { session_id: 100 });
-        let r = e.apply(&SmbEvent::Open { session_id: Some(100), tree_id: Some(10), path: "z".into() });
-        // Tree still maps to session 100, but the session is gone -> unresolved.
+        e.apply(&SmbEvent::SessionEnd { session: SESS_A });
+        let r = e.apply(&SmbEvent::Open { session: Some(SESS_A), tree: Some(TREE_A), path: "z".into(), access: 0 });
+        // Tree still maps to session SESS_A, but the session is gone -> unresolved.
         assert!(r.is_none());
     }
 }

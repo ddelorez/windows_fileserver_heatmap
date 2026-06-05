@@ -82,43 +82,73 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Discover mode: for each target event, print whichever candidate property
-/// name actually parsed and its value. This is the authoritative way to learn
-/// the real field names — trim the arrays in events.rs to what shows up here.
-/// (Cross-check against PerfView's event view if a field never appears.)
+/// Discover mode: print one line per record, prefixed by the event id, so that
+/// related twins land on adjacent lines and shared keys (e.g. a 600's and a
+/// 650's TreeConnectGUID/ShareGUID) can be eyeballed against each other.
+///
+/// 600/650 carry the correlation-critical fields, so those get an explicit,
+/// ordered field set; every other target event falls back to a generic sweep
+/// of whichever known properties parse. Names/types mirror the confirmed schema
+/// in events.rs, reusing its parse + GUID-formatting helpers.
 fn discover_dump(id: u16, parser: &Parser) {
     if !DISCOVER_TARGETS.contains(&id) {
         return;
     }
-    println!("--- event {id} ---");
-    dump_u64(parser, "conn_id", events::P_CONN_ID);
-    dump_u64(parser, "session_id", events::P_SESSION_ID);
-    dump_u64(parser, "tree_id", events::P_TREE_ID);
-    dump_str(parser, "user", events::P_USER_NAME);
-    dump_str(parser, "user_sid", events::P_USER_SID);
-    dump_str(parser, "share", events::P_SHARE_NAME);
-    dump_str(parser, "file", events::P_FILE_NAME);
-    dump_str(parser, "client", events::P_CLIENT_ADDR);
+
+    let fields: Vec<String> = match id {
+        // Smb2FileOpen — the access pulse; print the open identity, its tree/
+        // share linkage, the path, and the access mask.
+        events::E_OPEN => vec![
+            field_str("Name", parser, events::P_FILE_NAME),
+            field_guid("OpenGUID", parser, events::P_OPEN_GUID),
+            field_guid("ShareGUID", parser, events::P_SHARE_GUID),
+            field_guid("TreeConnectGUID", parser, events::P_TREE_GUID),
+            field_access("DesiredAccess", parser, events::P_DESIRED_ACCESS),
+        ],
+        // Smb2TreeConnectAllocate — print the share name and the same two GUIDs
+        // a 650 carries, so the two records line up.
+        events::E_TREE_ALLOC => vec![
+            field_str("ShareName", parser, events::P_SHARE_NAME),
+            field_guid("ShareGUID", parser, events::P_SHARE_GUID),
+            field_guid("TreeConnectGUID", parser, events::P_TREE_GUID),
+        ],
+        // Every other target event: generic sweep of whichever known property
+        // parses on this record.
+        _ => vec![
+            field_guid("ConnectionGUID", parser, events::P_CONN_GUID),
+            field_guid("SessionGUID", parser, events::P_SESSION_GUID),
+            field_guid("TreeConnectGUID", parser, events::P_TREE_GUID),
+            field_guid("ShareGUID", parser, events::P_SHARE_GUID),
+            field_guid("OpenGUID", parser, events::P_OPEN_GUID),
+            field_str("UserName", parser, events::P_USER_NAME),
+            field_str("DomainName", parser, events::P_DOMAIN_NAME),
+            field_str("ShareName", parser, events::P_SHARE_NAME),
+            field_str("ScopeName", parser, events::P_SCOPE_NAME),
+            field_str("Name", parser, events::P_FILE_NAME),
+            field_str("TransportName", parser, events::P_TRANSPORT),
+            field_addr("Address", parser, events::P_ADDRESS),
+            field_access("DesiredAccess", parser, events::P_DESIRED_ACCESS),
+        ],
+    }
+    .into_iter()
+    .flatten()
+    .collect();
+
+    println!("{id:>3}  {}", fields.join("  "));
 }
 
-fn dump_u64(parser: &Parser, label: &str, names: &[&str]) {
-    for n in names {
-        if let Ok(v) = parser.try_parse::<u64>(n) {
-            println!("  {label:<11} <- {n} = {v} (u64)");
-            return;
-        }
-        if let Ok(v) = parser.try_parse::<u32>(n) {
-            println!("  {label:<11} <- {n} = {v} (u32)");
-            return;
-        }
-    }
+fn field_guid(label: &str, parser: &Parser, names: &[&str]) -> Option<String> {
+    events::first_guid(parser, names).map(|k| format!("{label}={}", events::fmt_guid_key(k)))
 }
 
-fn dump_str(parser: &Parser, label: &str, names: &[&str]) {
-    for n in names {
-        if let Ok(v) = parser.try_parse::<String>(n) {
-            println!("  {label:<11} <- {n} = {v}");
-            return;
-        }
-    }
+fn field_str(label: &str, parser: &Parser, names: &[&str]) -> Option<String> {
+    events::first_str(parser, names).map(|v| format!("{label}={v}"))
+}
+
+fn field_addr(label: &str, parser: &Parser, names: &[&str]) -> Option<String> {
+    events::first_socket_addr(parser, names).map(|v| format!("{label}={v}"))
+}
+
+fn field_access(label: &str, parser: &Parser, names: &[&str]) -> Option<String> {
+    events::first_u64(parser, names).map(|v| format!("{label}=0x{:08X}", v as u32))
 }
