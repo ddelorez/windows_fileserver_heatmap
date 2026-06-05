@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::trace::{TraceTrait, UserTrace};
 use ferrisetw::EventRecord;
 
 use crate::correlation::CorrelationEngine;
@@ -63,7 +63,7 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
 
     let provider = Provider::by_guid(SMBSERVER_GUID)
         .add_callback(callback)
-        .any_keyword(mask)
+        .any(mask)
         // .level(...) // Defaults are usually fine. If no events arrive, set the
         //             // trace level to Informational (4) — these events are level 4.
         .build();
@@ -71,11 +71,13 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
     let (_trace, handle) = UserTrace::new()
         .named(SESSION_NAME.to_string())
         .enable(provider)
-        .start()?;
+        .start()
+        .map_err(|e| format!("failed to start ETW trace: {e:?}"))?;
     // VERIFY (ferrisetw API): depending on version this blocking call may be
     // `UserTrace::process_from_handle(handle)?;` (as below) or the trace may
     // process via `start_and_process()` / `trace.process()`. Adjust to match.
-    UserTrace::process_from_handle(handle)?;
+    UserTrace::process_from_handle(handle)
+        .map_err(|e| format!("ETW trace processing failed: {e:?}"))?;
 
     Ok(())
 }

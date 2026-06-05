@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo check:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Read",
+      "Edit(src/**)"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(git push:*)",
+      "Read(./.env*)"
+    ],
+    "defaultMode": "default"
+  }
+}
