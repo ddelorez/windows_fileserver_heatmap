@@ -52,9 +52,17 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(access) = eng.apply(&ev) {
                         println!("{access}");
                     }
-                    // Periodic heartbeat so you can watch the resolve ratio.
+                    // Lightweight heartbeat so you can watch progress.
                     if eng.opens_total % 200 == 0 && eng.opens_total > 0 {
                         eprintln!("  [{}]", eng.stats_line());
+                    }
+                    // Periodic full resolved-table dump. Ctrl+C on a busy server
+                    // is unreliable (and we can't reach a final flush after an
+                    // abrupt kill), so we keep a recent authoritative tally in
+                    // the stream — names resolved at dump time, so late 600s have
+                    // already named earlier opens.
+                    if eng.opens_total % 1000 == 0 && eng.opens_total > 0 {
+                        print!("{}", eng.resolved_table());
                     }
                 }
             }
@@ -76,8 +84,17 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
     // VERIFY (ferrisetw API): depending on version this blocking call may be
     // `UserTrace::process_from_handle(handle)?;` (as below) or the trace may
     // process via `start_and_process()` / `trace.process()`. Adjust to match.
-    UserTrace::process_from_handle(handle)
-        .map_err(|e| format!("ETW trace processing failed: {e:?}"))?;
+    let status = UserTrace::process_from_handle(handle);
+
+    // Final flush on a graceful stop (trace end, or `logman stop SmbHeatSpike
+    // -ets`). An abrupt Ctrl+C kill won't reach here — the periodic dumps in the
+    // callback cover that case.
+    if let Mode::Resolve = mode {
+        let eng = engine.lock().unwrap();
+        print!("{}", eng.resolved_table());
+    }
+
+    status.map_err(|e| format!("ETW trace processing failed: {e:?}"))?;
 
     Ok(())
 }
