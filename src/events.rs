@@ -121,16 +121,20 @@ pub const P_DESIRED_ACCESS: &[&str] = &["DesiredAccess"];
 
 // ---------------------------------------------------------------------------
 // Normalized event — decouples the engine from ETW parsing.
+//
+// The resolve path is now share-name resolution + per-file heat counting, so
+// only the two events that drive it are modeled. Identity is intentionally out
+// of scope (no 500/552 user/client rejoin), hence no Conn*/Session* variants.
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 pub enum SmbEvent {
-    ConnAccept { conn: GuidKey, client: String },
-    ConnEnd { conn: GuidKey },
-    SessionAuth { session: GuidKey, conn: Option<GuidKey>, user: String, domain: String },
-    SessionEnd { session: GuidKey },
-    TreeConnect { tree: GuidKey, session: GuidKey, share: String },
-    TreeEnd { tree: GuidKey },
-    Open { session: Option<GuidKey>, tree: Option<GuidKey>, path: String, access: u32 },
+    /// 600 Smb2TreeConnectAllocate — supplies the ShareGUID -> ShareName binding
+    /// the engine keys share resolution on.
+    TreeConnect { share_guid: GuidKey, share: String },
+    /// 650 Smb2FileOpen — the access pulse. Carries its own ShareGUID (the share
+    /// key), OpenGUID (the heat counter), and TreeConnectGUID (kept for
+    /// reference, no longer the share key).
+    Open { open: GuidKey, tree: GuidKey, share_guid: Option<GuidKey>, path: String, access: u32 },
 }
 
 /// Try each candidate name as a string property; return the first that parses.
@@ -210,36 +214,22 @@ pub fn decode_socket_address(b: &[u8]) -> String {
 }
 
 /// Map a raw event to a normalized `SmbEvent`. Returns `None` for ids we don't
-/// model or when a required key is missing (the spike just skips those).
+/// model (everything outside 600/650 now) or when a required key is missing.
 pub fn parse_event(event_id: u16, parser: &Parser) -> Option<SmbEvent> {
     match event_id {
-        E_CONN_ACCEPT => Some(SmbEvent::ConnAccept {
-            conn: first_guid(parser, P_CONN_GUID)?,
-            client: first_socket_addr(parser, P_ADDRESS).unwrap_or_default(),
-        }),
-        E_CONN_DISC | E_CONN_TERM => Some(SmbEvent::ConnEnd {
-            conn: first_guid(parser, P_CONN_GUID)?,
-        }),
-        E_SESS_AUTH => Some(SmbEvent::SessionAuth {
-            session: first_guid(parser, P_SESSION_GUID)?,
-            conn: first_guid(parser, P_CONN_GUID),
-            user: first_str(parser, P_USER_NAME).unwrap_or_default(),
-            domain: first_str(parser, P_DOMAIN_NAME).unwrap_or_default(),
-        }),
-        E_SESS_TERM | E_SESS_CLOSE => Some(SmbEvent::SessionEnd {
-            session: first_guid(parser, P_SESSION_GUID)?,
-        }),
+        // 600 carries both the ShareGUID and the ShareName — the binding the
+        // engine resolves shares on.
         E_TREE_ALLOC => Some(SmbEvent::TreeConnect {
-            tree: first_guid(parser, P_TREE_GUID)?,
-            session: first_guid(parser, P_SESSION_GUID).unwrap_or(0),
+            share_guid: first_guid(parser, P_SHARE_GUID)?,
             share: first_str(parser, P_SHARE_NAME).unwrap_or_default(),
         }),
-        E_TREE_DISC | E_TREE_TERM => Some(SmbEvent::TreeEnd {
-            tree: first_guid(parser, P_TREE_GUID)?,
-        }),
+        // 650 resolves its share via its OWN ShareGUID; OpenGUID is the heat
+        // counter. An open with no OpenGUID can't be counted, so it's skipped;
+        // a missing ShareGUID is allowed (resolves to UNKNOWN downstream).
         E_OPEN => Some(SmbEvent::Open {
-            session: first_guid(parser, P_SESSION_GUID),
-            tree: first_guid(parser, P_TREE_GUID),
+            open: first_guid(parser, P_OPEN_GUID)?,
+            tree: first_guid(parser, P_TREE_GUID).unwrap_or(0),
+            share_guid: first_guid(parser, P_SHARE_GUID),
             path: first_str(parser, P_FILE_NAME).unwrap_or_default(),
             access: first_u64(parser, P_DESIRED_ACCESS).unwrap_or(0) as u32,
         }),
