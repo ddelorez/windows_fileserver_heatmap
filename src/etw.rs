@@ -48,8 +48,11 @@ pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
             Mode::Discover => discover_dump(id, &parser),
             Mode::Resolve => {
                 if let Some(ev) = events::parse_event(id, &parser) {
+                    // FILETIME (100ns since 1601 UTC); the engine maps it to a
+                    // America/Chicago civil day for per-day demand counts.
+                    let event_filetime = record.raw_timestamp();
                     let mut eng = engine_cb.lock().unwrap();
-                    if let Some(access) = eng.apply(&ev) {
+                    if let Some(access) = eng.apply(&ev, event_filetime) {
                         println!("{access}");
                     }
                     // Lightweight heartbeat so you can watch progress.

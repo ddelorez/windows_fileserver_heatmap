@@ -13,6 +13,11 @@ walkdir = "2.5.0"   # inventory walker (src/inventory.rs)
 # Pinned to 0.57 to match the windows crate ferrisetw already pulls in (no
 # duplicate copy). GetDiskFreeSpaceW lives in Win32_Storage_FileSystem.
 windows = { version = "0.57", features = ["Win32_Storage_FileSystem"] }
+# Per-day demand bucketing in America/Chicago civil time. default-features=false
+# drops chrono's `clock` feature (and thus iana-time-zone, which would pull a
+# second windows-core) — we only do fixed-zone arithmetic, never Local::now().
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.9"
 
 [profile.release]
 opt-level = 3

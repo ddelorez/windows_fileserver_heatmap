@@ -1,10 +1,10 @@
-//! The correlation engine — per-file heat counting with deferred share naming.
+//! The correlation engine — per-file read/write demand with deferred share naming.
 //!
 //! Two tables:
 //!   * `shares`: ShareGUID -> ShareName, learned from event 600
 //!     (Smb2TreeConnectAllocate, which carries both per SCHEMA).
-//!   * `heat`:   (ShareGUID, normalized path) -> the set of distinct OpenGUIDs
-//!     observed against that file.
+//!   * `heat`:   (ShareGUID, normalized path) -> a sparse per-day read/write
+//!     count (`BTreeMap<day_index, DayCount>`).
 //!
 //! The heat table is keyed on the open's **ShareGUID**, not the share name, and
 //! names are resolved only at emission time. This means a 600 seen at ANY point
@@ -12,10 +12,19 @@
 //! before the binding 600 (the common pre-existing-mount case). A ShareGUID that
 //! no 600 ever binds emits as UNKNOWN.
 //!
+//! Opens are NOT deduplicated: this provider emits one OpenGUID per open (a
+//! capture showed 115 opens / 115 distinct OpenGUIDs), and path-casing collapse
+//! is already handled by the lowercased key — so no per-key OpenGUID set is kept.
+//! The demand signal is per-day read/write counts; metadata-only opens are
+//! dropped (counted in a global diagnostic).
+//!
 //! Identity is intentionally out of scope here — no 500/552 user/client rejoin.
 //! Pure and unit-tested; no ETW dependency.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+
+use chrono::{DateTime, NaiveDate};
+use chrono_tz::America::Chicago;
 
 use crate::events::{fmt_guid_key, GuidKey, SmbEvent};
 
@@ -28,14 +37,63 @@ type HeatKey = (Option<GuidKey>, String);
 /// counted, never dropped.
 const UNKNOWN_SHARE: &str = "UNKNOWN";
 
+/// Seconds between the FILETIME epoch (1601-01-01 UTC) and the Unix epoch.
+const FILETIME_TO_UNIX_SECS: i64 = 11_644_473_600;
+
+// DesiredAccess bits (Win32). Precedence is locked: any write bit -> Write,
+// else read bit -> Read, else Metadata.
+const FILE_READ_DATA: u32 = 0x1;
+const FILE_WRITE_DATA: u32 = 0x2;
+const FILE_APPEND_DATA: u32 = 0x4;
+const WRITE_MASK: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA; // 0x6
+
+/// How an open touches file data, per its DesiredAccess mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+    Metadata,
+}
+
+/// Classify a DesiredAccess mask. Write wins over read (an EC read-modify-write
+/// is the expensive case we don't want masked by a co-set read bit); a pure
+/// metadata/attribute open touches no data.
+pub fn classify_access(desired: u32) -> Access {
+    if desired & WRITE_MASK != 0 {
+        Access::Write
+    } else if desired & FILE_READ_DATA != 0 {
+        Access::Read
+    } else {
+        Access::Metadata
+    }
+}
+
+/// Convert a ferrisetw `raw_timestamp()` (FILETIME: 100 ns ticks since
+/// 1601-01-01 UTC) to a day index = days since the Unix epoch in
+/// America/Chicago civil (DST-aware) time.
+pub fn central_civil_day(filetime_100ns: i64) -> i32 {
+    let unix_secs = filetime_100ns / 10_000_000 - FILETIME_TO_UNIX_SECS;
+    let utc = DateTime::from_timestamp(unix_secs, 0).unwrap_or_default();
+    let local_date = utc.with_timezone(&Chicago).date_naive();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch date");
+    local_date.signed_duration_since(epoch).num_days() as i32
+}
+
+/// Per-day read/write counts for one file. Sparse: only days with activity exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayCount {
+    pub reads: u32,
+    pub writes: u32,
+}
+
 /// Format an optional ShareGUID for display.
 fn fmt_share_guid(g: Option<GuidKey>) -> String {
     g.map(fmt_guid_key).unwrap_or_else(|| "<none>".to_string())
 }
 
-/// A single open as emitted live (one line per 650). `share` is resolved as
-/// currently known; the authoritative names come from `resolved_summary`, which
-/// re-resolves once all 600s have been seen.
+/// A single accepted (read/write) open as emitted live (one line per 650).
+/// `share` is resolved as currently known; authoritative names come from
+/// `resolved_summary`, which re-resolves once all 600s have been seen.
 #[derive(Debug, Clone)]
 pub struct ResolvedAccess {
     pub share_guid: Option<GuidKey>,
@@ -44,21 +102,23 @@ pub struct ResolvedAccess {
     pub tree: GuidKey,
     pub open: GuidKey,
     pub access: u32,
-    pub opens_on_key: u64,
+    pub kind: Access,
+    pub day: i32,
 }
 
 impl std::fmt::Display for ResolvedAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}\\{}  share_guid={} open={} tree={} access=0x{:08X} [{} opens]",
+            "{}\\{}  share_guid={} open={} tree={} access=0x{:08X} {:?} day={}",
             self.share,
             self.path,
             fmt_share_guid(self.share_guid),
             fmt_guid_key(self.open),
             fmt_guid_key(self.tree),
             self.access,
-            self.opens_on_key,
+            self.kind,
+            self.day,
         )
     }
 }
@@ -69,15 +129,20 @@ pub struct HeatRow {
     pub share_guid: Option<GuidKey>,
     pub share: String,
     pub path: String,
-    pub opens: u64,
+    pub reads: u64,
+    pub writes: u64,
+    /// Count of days with any (read or write) activity.
+    pub active_days: u64,
 }
 
 impl std::fmt::Display for HeatRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:>6} opens  {}\\{}  [share_guid={}]",
-            self.opens,
+            "reads={:>7} writes={:>7} active_days={:>4}  {}\\{}  [share_guid={}]",
+            self.reads,
+            self.writes,
+            self.active_days,
             self.share,
             self.path,
             fmt_share_guid(self.share_guid),
@@ -89,16 +154,21 @@ impl std::fmt::Display for HeatRow {
 pub struct CorrelationEngine {
     /// ShareGUID -> ShareName, learned from 600 (Smb2TreeConnectAllocate).
     shares: HashMap<GuidKey, String>,
-    /// (ShareGUID, normalized path) -> distinct OpenGUIDs counted there.
-    heat: HashMap<HeatKey, HashSet<GuidKey>>,
+    /// (ShareGUID, normalized path) -> sparse per-day read/write counts.
+    heat: HashMap<HeatKey, BTreeMap<i32, DayCount>>,
 
+    /// Non-metadata (read/write) opens folded into the table.
     pub opens_total: u64,
+    /// Metadata-only opens dropped before the table (global diagnostic).
+    pub metadata_skipped: u64,
 }
 
 impl CorrelationEngine {
-    /// Ingest one normalized event. Returns `Some` for every open (the access
-    /// pulse), carrying the share name as known at that instant.
-    pub fn apply(&mut self, ev: &SmbEvent) -> Option<ResolvedAccess> {
+    /// Ingest one normalized event. `event_filetime` is the ETW record timestamp
+    /// (ferrisetw `raw_timestamp()`), used only for the day index on opens.
+    /// Returns `Some` for each accepted (read/write) open; `None` for binds and
+    /// for metadata-only opens.
+    pub fn apply(&mut self, ev: &SmbEvent, event_filetime: i64) -> Option<ResolvedAccess> {
         match ev {
             SmbEvent::TreeConnect { share_guid, share } => {
                 // Binding can arrive at any time; because heat is keyed on
@@ -107,15 +177,29 @@ impl CorrelationEngine {
                 None
             }
             SmbEvent::Open { open, tree, share_guid, path, access } => {
+                let kind = classify_access(*access);
+                if kind == Access::Metadata {
+                    // Touches no file data — not demand. Drop, count globally.
+                    self.metadata_skipped += 1;
+                    return None;
+                }
+
                 self.opens_total += 1;
+                let day = central_civil_day(event_filetime);
 
                 // Fold case so casing-only path variants collapse; key by
                 // ShareGUID so naming can be deferred to output time.
-                let opens_on_key = {
-                    let seen = self.heat.entry((*share_guid, path.to_lowercase())).or_default();
-                    seen.insert(*open); // distinct OpenGUIDs; repeats count once
-                    seen.len() as u64
-                };
+                let dc = self
+                    .heat
+                    .entry((*share_guid, path.to_lowercase()))
+                    .or_default()
+                    .entry(day)
+                    .or_default();
+                match kind {
+                    Access::Read => dc.reads += 1,
+                    Access::Write => dc.writes += 1,
+                    Access::Metadata => unreachable!("metadata returned above"),
+                }
 
                 Some(ResolvedAccess {
                     share_guid: *share_guid,
@@ -124,7 +208,8 @@ impl CorrelationEngine {
                     tree: *tree,
                     open: *open,
                     access: *access,
-                    opens_on_key,
+                    kind,
+                    day,
                 })
             }
         }
@@ -139,22 +224,30 @@ impl CorrelationEngine {
     }
 
     /// The aggregated heat table, names resolved at call time (so a 600 seen
-    /// since the opens accrued now names them). Hottest first, with a stable
-    /// tiebreak for deterministic output.
+    /// since the opens accrued now names them). Hottest first (by total
+    /// accesses), with a stable tiebreak for deterministic output.
     pub fn resolved_summary(&self) -> Vec<HeatRow> {
         let mut rows: Vec<HeatRow> = self
             .heat
             .iter()
-            .map(|((sg, path), opens)| HeatRow {
-                share_guid: *sg,
-                share: self.resolve_name(*sg),
-                path: path.clone(),
-                opens: opens.len() as u64,
+            .map(|((sg, path), days)| {
+                let reads: u64 = days.values().map(|d| d.reads as u64).sum();
+                let writes: u64 = days.values().map(|d| d.writes as u64).sum();
+                let active_days =
+                    days.values().filter(|d| d.reads > 0 || d.writes > 0).count() as u64;
+                HeatRow {
+                    share_guid: *sg,
+                    share: self.resolve_name(*sg),
+                    path: path.clone(),
+                    reads,
+                    writes,
+                    active_days,
+                }
             })
             .collect();
         rows.sort_by(|a, b| {
-            b.opens
-                .cmp(&a.opens)
+            (b.reads + b.writes)
+                .cmp(&(a.reads + a.writes))
                 .then_with(|| a.share.cmp(&b.share))
                 .then_with(|| a.path.cmp(&b.path))
         });
@@ -165,7 +258,7 @@ impl CorrelationEngine {
     pub fn resolved_table(&self) -> String {
         let rows = self.resolved_summary();
         let mut out = format!(
-            "=== resolved heat: {} keys, {} opens ===\n",
+            "=== resolved heat: {} keys, {} r/w opens ===\n",
             rows.len(),
             self.opens_total
         );
@@ -173,16 +266,26 @@ impl CorrelationEngine {
             out.push_str(&r.to_string());
             out.push('\n');
         }
+        out.push_str(&format!("metadata-skipped: {}\n", self.metadata_skipped));
         out
     }
 
-    /// Distinct opens counted for a `(share_guid, path)` key. `path` is
-    /// case-folded to match how the key was stored.
+    /// Per-day counts for a `(share_guid, path)` key (path is case-folded).
     #[allow(dead_code)] // query API: used by tests now, reporting later
-    pub fn opens_for(&self, share_guid: Option<GuidKey>, path: &str) -> usize {
+    pub fn day_count(&self, share_guid: Option<GuidKey>, path: &str, day: i32) -> DayCount {
         self.heat
             .get(&(share_guid, path.to_lowercase()))
-            .map_or(0, HashSet::len)
+            .and_then(|days| days.get(&day))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Number of distinct day entries for a `(share_guid, path)` key.
+    #[allow(dead_code)] // query API: used by tests now, reporting later
+    pub fn day_entries(&self, share_guid: Option<GuidKey>, path: &str) -> usize {
+        self.heat
+            .get(&(share_guid, path.to_lowercase()))
+            .map_or(0, BTreeMap::len)
     }
 
     /// Number of distinct `(share_guid, path)` heat keys tracked.
@@ -198,8 +301,9 @@ impl CorrelationEngine {
             .filter(|(sg, _)| sg.is_some_and(|g| self.shares.contains_key(&g)))
             .count();
         format!(
-            "opens: {} total | keys: {} ({} named, {} UNKNOWN) | shares bound: {}",
+            "r/w opens: {} | metadata-skipped: {} | keys: {} ({} named, {} UNKNOWN) | shares bound: {}",
             self.opens_total,
+            self.metadata_skipped,
             self.heat.len(),
             named,
             self.heat.len() - named,
@@ -219,8 +323,26 @@ mod tests {
     const OPEN_1: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0001;
     const OPEN_2: GuidKey = 0x0000_0000_0000_0000_0000_0000_0000_0002;
 
-    fn open(open: GuidKey, share_guid: Option<GuidKey>, path: &str) -> SmbEvent {
-        SmbEvent::Open { open, tree: TREE_1, share_guid, path: path.into(), access: 0x0012_0089 }
+    // Locked masks from the spec.
+    const READ: u32 = 0x0012_0089;
+    const WRITE: u32 = 0x0012_019F;
+    const META: u32 = 0x0012_0080;
+
+    // FILETIME for a given Unix-seconds instant.
+    fn ft(unix_secs: i64) -> i64 {
+        (unix_secs + FILETIME_TO_UNIX_SECS) * 10_000_000
+    }
+
+    // A winter (CST) instant; whole days apart stay one Chicago day apart.
+    fn ft_day_a() -> i64 {
+        ft(1_610_690_400) // 2021-01-15 06:00:00Z -> 2021-01-15 00:00 CST (day 18642)
+    }
+    fn ft_day_b() -> i64 {
+        ft(1_610_690_400 + 86_400) // 2021-01-16 (day 18643)
+    }
+
+    fn open(open: GuidKey, share_guid: Option<GuidKey>, path: &str, access: u32) -> SmbEvent {
+        SmbEvent::Open { open, tree: TREE_1, share_guid, path: path.into(), access }
     }
 
     fn row_for<'a>(rows: &'a [HeatRow], path: &str) -> &'a HeatRow {
@@ -228,14 +350,96 @@ mod tests {
     }
 
     #[test]
-    fn share_name_resolves_at_output_via_shareguid() {
+    fn classify_access_precedence() {
+        assert_eq!(classify_access(0x0012_0089), Access::Read);
+        assert_eq!(classify_access(0x0012_019F), Access::Write);
+        assert_eq!(classify_access(0x0012_0080), Access::Metadata);
+        assert_eq!(classify_access(0x80), Access::Metadata);
+        assert_eq!(classify_access(0x0010_0080), Access::Metadata);
+        // Write bit set alongside read bit -> Write wins.
+        assert_eq!(classify_access(FILE_READ_DATA | FILE_WRITE_DATA), Access::Write);
+        assert_eq!(classify_access(FILE_APPEND_DATA), Access::Write);
+    }
+
+    #[test]
+    fn central_civil_day_cst_and_cdt() {
+        // CST (UTC-6): 2021-01-15 06:00:00Z == 2021-01-15 00:00 local -> 18642.
+        assert_eq!(central_civil_day(ft(1_610_690_400)), 18642);
+        // The same 05:00Z wall-clock in winter is still the PREVIOUS Chicago day
+        // (offset -6): 2021-01-15 05:00Z -> 2021-01-14 23:00 CST -> 18641.
+        assert_eq!(central_civil_day(ft(1_610_686_800)), 18641);
+        // CDT (UTC-5): 2021-07-15 05:00:00Z == 2021-07-15 00:00 local -> 18823.
+        // Under CST that instant would be 18822 — confirms the offset flipped.
+        assert_eq!(central_civil_day(ft(1_626_325_200)), 18823);
+    }
+
+    #[test]
+    fn metadata_open_does_not_touch_table_but_bumps_counter() {
         let mut e = CorrelationEngine::default();
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() });
+        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() }, ft_day_a());
+        let r = e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\m.txt", META), ft_day_a());
+        assert!(r.is_none());
+        assert_eq!(e.distinct_keys(), 0);
+        assert_eq!(e.metadata_skipped, 1);
+        assert_eq!(e.opens_total, 0);
+    }
+
+    #[test]
+    fn reads_and_writes_land_in_the_right_counter() {
+        let mut e = CorrelationEngine::default();
         let r = e
-            .apply(&open(OPEN_1, Some(SHARE_DATA), "\\projects\\q3.xlsx"))
-            .expect("an open is always emitted");
-        assert_eq!(r.share, "DATA");
-        assert_eq!(r.share_guid, Some(SHARE_DATA));
+            .apply(&open(OPEN_1, Some(SHARE_DATA), "\\a.txt", READ), ft_day_a())
+            .unwrap();
+        assert_eq!(r.kind, Access::Read);
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "\\a.txt", WRITE), ft_day_a());
+
+        let dc = e.day_count(Some(SHARE_DATA), "\\a.txt", 18642);
+        assert_eq!(dc, DayCount { reads: 1, writes: 1 });
+        assert_eq!(e.opens_total, 2);
+    }
+
+    #[test]
+    fn same_key_same_day_counts_add_on_one_entry() {
+        let mut e = CorrelationEngine::default();
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\a.txt", READ), ft_day_a());
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "\\a.txt", READ), ft_day_a());
+        // No dedup: two distinct opens on the same day add up.
+        assert_eq!(e.day_entries(Some(SHARE_DATA), "\\a.txt"), 1);
+        assert_eq!(e.day_count(Some(SHARE_DATA), "\\a.txt", 18642).reads, 2);
+    }
+
+    #[test]
+    fn same_key_different_days_make_two_entries() {
+        let mut e = CorrelationEngine::default();
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\a.txt", READ), ft_day_a());
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "\\a.txt", READ), ft_day_b());
+        assert_eq!(e.day_entries(Some(SHARE_DATA), "\\a.txt"), 2);
+        assert_eq!(e.day_count(Some(SHARE_DATA), "\\a.txt", 18642).reads, 1);
+        assert_eq!(e.day_count(Some(SHARE_DATA), "\\a.txt", 18643).reads, 1);
+    }
+
+    #[test]
+    fn casing_variant_paths_collapse_to_one_key() {
+        let mut e = CorrelationEngine::default();
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\Reports\\Q3.XLSX", READ), ft_day_a());
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "\\reports\\q3.xlsx", WRITE), ft_day_a());
+        assert_eq!(e.distinct_keys(), 1);
+        let dc = e.day_count(Some(SHARE_DATA), "\\reports\\q3.xlsx", 18642);
+        assert_eq!(dc, DayCount { reads: 1, writes: 1 });
+    }
+
+    #[test]
+    fn active_days_counts_nonzero_days() {
+        let mut e = CorrelationEngine::default();
+        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() }, ft_day_a());
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\a.txt", READ), ft_day_a());
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "\\a.txt", WRITE), ft_day_b());
+        let rows = e.resolved_summary();
+        let row = row_for(&rows, "\\a.txt");
+        assert_eq!(row.reads, 1);
+        assert_eq!(row.writes, 1);
+        assert_eq!(row.active_days, 2);
+        assert_eq!(row.share, "DATA");
     }
 
     #[test]
@@ -243,67 +447,28 @@ mod tests {
         let mut e = CorrelationEngine::default();
         // Pre-existing mount: the open arrives BEFORE its binding 600.
         let early = e
-            .apply(&open(OPEN_1, Some(SHARE_DATA), "\\pre\\mount.db"))
+            .apply(&open(OPEN_1, Some(SHARE_DATA), "\\pre\\mount.db", READ), ft_day_a())
             .unwrap();
-        assert_eq!(early.share, "UNKNOWN"); // not yet bound at open time
-
-        // The binding 600 shows up later in the run.
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() });
-
-        // The aggregated summary now names that earlier open.
+        assert_eq!(early.share, "UNKNOWN");
+        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() }, ft_day_a());
         let rows = e.resolved_summary();
-        let row = row_for(&rows, "\\pre\\mount.db");
-        assert_eq!(row.share, "DATA");
-        assert_eq!(row.share_guid, Some(SHARE_DATA));
-        assert_eq!(row.opens, 1);
+        assert_eq!(row_for(&rows, "\\pre\\mount.db").share, "DATA");
     }
 
     #[test]
     fn unbound_shareguid_emits_unknown_and_is_not_dropped() {
         let mut e = CorrelationEngine::default();
-        // No 600 ever binds SHARE_HOME.
-        let r = e
-            .apply(&open(OPEN_1, Some(SHARE_HOME), "\\x"))
-            .expect("an unbound share must NOT drop the open");
-        assert_eq!(r.share, "UNKNOWN");
-        assert_eq!(e.opens_for(Some(SHARE_HOME), "\\x"), 1);
+        e.apply(&open(OPEN_1, Some(SHARE_HOME), "\\x", READ), ft_day_a());
         let rows = e.resolved_summary();
         assert_eq!(row_for(&rows, "\\x").share, "UNKNOWN");
-    }
-
-    #[test]
-    fn casing_only_paths_collapse_and_distinct_opens_count_separately() {
-        let mut e = CorrelationEngine::default();
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() });
-        // Two DISTINCT opens whose Name differs only in case.
-        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\Reports\\Q3.XLSX"));
-        let r2 = e
-            .apply(&open(OPEN_2, Some(SHARE_DATA), "\\reports\\q3.xlsx"))
-            .unwrap();
-        // (a) the casing-only variants collapse to a single heat key.
-        assert_eq!(e.distinct_keys(), 1);
-        // (b) the two distinct OpenGUIDs count as 2 against that key.
-        assert_eq!(e.opens_for(Some(SHARE_DATA), "\\reports\\q3.xlsx"), 2);
-        assert_eq!(r2.opens_on_key, 2);
-    }
-
-    #[test]
-    fn repeated_openguid_counts_once() {
-        let mut e = CorrelationEngine::default();
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() });
-        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\a\\b.txt"));
-        let r = e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\A\\B.TXT")).unwrap();
-        assert_eq!(r.opens_on_key, 1);
-        assert_eq!(e.opens_for(Some(SHARE_DATA), "\\a\\b.txt"), 1);
+        assert_eq!(e.day_count(Some(SHARE_HOME), "\\x", 18642).reads, 1);
     }
 
     #[test]
     fn distinct_shares_are_separate_keys() {
         let mut e = CorrelationEngine::default();
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "DATA".into() });
-        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_HOME, share: "HOME".into() });
-        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\f"));
-        e.apply(&open(OPEN_2, Some(SHARE_HOME), "\\f"));
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\f", READ), ft_day_a());
+        e.apply(&open(OPEN_2, Some(SHARE_HOME), "\\f", READ), ft_day_a());
         assert_eq!(e.distinct_keys(), 2);
     }
 }
