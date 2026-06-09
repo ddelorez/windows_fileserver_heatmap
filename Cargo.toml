@@ -9,6 +9,10 @@ description = "Correlation-engine spike: resolve SMBServer ETW opens to (user, s
 ferrisetw = "1.1"   # VERIFY: pin to the version actually on your dev VM; the ETW
                     # session API in src/etw.rs is the thing most likely to need a
                     # small tweak to match the pinned version's examples.
+walkdir = "2.5.0"   # inventory walker (src/inventory.rs)
+# Pinned to 0.57 to match the windows crate ferrisetw already pulls in (no
+# duplicate copy). GetDiskFreeSpaceW lives in Win32_Storage_FileSystem.
+windows = { version = "0.57", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3
