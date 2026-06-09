@@ -21,12 +21,13 @@
 //! Identity is intentionally out of scope here — no 500/552 user/client rejoin.
 //! Pure and unit-tested; no ETW dependency.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, NaiveDate};
 use chrono_tz::America::Chicago;
 
 use crate::events::{fmt_guid_key, GuidKey, SmbEvent};
+use crate::inventory::Inventory;
 
 /// Heat key: the open's ShareGUID (resolved to a name only at output time) plus
 /// the case-folded path. Keying on ShareGUID — not the name — is what lets a
@@ -150,12 +151,95 @@ impl std::fmt::Display for HeatRow {
     }
 }
 
+/// Outcome of the emit-time leaf/bytes join for one heat key. Pure: computed
+/// from the heat key plus the (immutable) inventory + walked-share set; the
+/// bridge never mutates the heat table (the periodic dump re-runs it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// Leaf file found in inventory — keep, attach allocated bytes.
+    Leaf { alloc_bytes: u64 },
+    /// Walked share, but no inventory entry for this path — keep, bytes unknown,
+    /// flag for a later re-stat.
+    Restat,
+    /// ShareGUID never bound by a 600 — keep, bytes unknown, flag unresolved.
+    UnresolvedShare,
+    /// Share-root open (empty path) — drop.
+    DropRoot,
+    /// Inventory says this path is a directory — drop. Authority is the
+    /// inventory dir flag, NOT the access mask.
+    DropDir,
+    /// Share was never in the walked allowlist (e.g. IPC$/admin) — drop.
+    DropNonWalkedShare,
+}
+
+/// Emit-time classification of one resolved heat key against the inventory.
+/// `share` is the resolved ShareName (`UNKNOWN_SHARE` if no 600 bound it);
+/// `norm_path` is the lowercased share-relative path. Pure, no I/O, no mutation.
+///
+/// ShareName matching is case-insensitive: inventory keys and the walked set are
+/// lowercased at load, and this lowercases the (600-derived) lookup ShareName.
+/// Precedence is locked: root, then unresolved-share, then non-walked-share,
+/// then the inventory dir/file split, then restat.
+pub fn classify_key(
+    share: &str,
+    norm_path: &str,
+    inventory: &Inventory,
+    walked_shares: &HashSet<String>,
+) -> KeyOutcome {
+    if norm_path.is_empty() {
+        return KeyOutcome::DropRoot;
+    }
+    if share == UNKNOWN_SHARE {
+        return KeyOutcome::UnresolvedShare;
+    }
+    let share_lc = share.to_lowercase();
+    if !walked_shares.contains(&share_lc) {
+        return KeyOutcome::DropNonWalkedShare;
+    }
+    match inventory.get(&(share_lc, norm_path.to_string())) {
+        Some(e) if e.is_dir => KeyOutcome::DropDir,
+        Some(e) => KeyOutcome::Leaf { alloc_bytes: e.alloc },
+        None => KeyOutcome::Restat,
+    }
+}
+
+/// Format one kept join row. `alloc` is `None` for restat/unresolved (shown as
+/// `?`); `flags` are bracketed tokens placed before the `share_guid`.
+fn fmt_join_row(r: &HeatRow, alloc: Option<u64>, flags: &[&str]) -> String {
+    let bytes = match alloc {
+        Some(b) => format!("{b:>9}"),
+        None => format!("{:>9}", "?"),
+    };
+    let mut flagstr = String::new();
+    for f in flags {
+        flagstr.push_str(&format!("[{f}] "));
+    }
+    format!(
+        "reads={:>4} writes={:>4} active_days={:>3} alloc_bytes={}  {}\\{}  {}[share_guid={}]\n",
+        r.reads,
+        r.writes,
+        r.active_days,
+        bytes,
+        r.share,
+        r.path,
+        flagstr,
+        fmt_share_guid(r.share_guid),
+    )
+}
+
 #[derive(Default)]
 pub struct CorrelationEngine {
     /// ShareGUID -> ShareName, learned from 600 (Smb2TreeConnectAllocate).
     shares: HashMap<GuidKey, String>,
     /// (ShareGUID, normalized path) -> sparse per-day read/write counts.
     heat: HashMap<HeatKey, BTreeMap<i32, DayCount>>,
+
+    /// File-size inventory (keys lowercased) loaded once at startup, read only
+    /// at emit — never touched by `apply`. Empty when no `--share` was given.
+    inventory: Inventory,
+    /// Set of walked ShareNames (lowercased). Non-empty iff the join is active;
+    /// distinguishes a walked-but-empty share from a never-walked one.
+    walked_shares: HashSet<String>,
 
     /// Non-metadata (read/write) opens folded into the table.
     pub opens_total: u64,
@@ -215,6 +299,14 @@ impl CorrelationEngine {
         }
     }
 
+    /// Load the startup inventory + walked-share allowlist (both lowercased).
+    /// Call once before processing; the join is emit-only and never mutates
+    /// these, and `apply` never reads them.
+    pub fn load_inventory(&mut self, inventory: Inventory, walked_shares: HashSet<String>) {
+        self.inventory = inventory;
+        self.walked_shares = walked_shares;
+    }
+
     /// Resolve a ShareGUID to its ShareName as currently known, or `UNKNOWN`.
     fn resolve_name(&self, share_guid: Option<GuidKey>) -> String {
         share_guid
@@ -255,17 +347,62 @@ impl CorrelationEngine {
     }
 
     /// The resolved heat table rendered for emission (periodic + final dump).
+    ///
+    /// With no inventory loaded (`--share` absent) this emits the pre-join table
+    /// unchanged. With an inventory it runs the emit-time bridge per key: drops
+    /// non-leaves (dir/share-root/non-walked-share) and attaches allocated bytes
+    /// to leaves, flagging restat/unresolved-share rows. The header reconciles —
+    /// emitted (leaf+restat+unresolved) + dropped == raw keys.
     pub fn resolved_table(&self) -> String {
         let rows = self.resolved_summary();
-        let mut out = format!(
-            "=== resolved heat: {} keys, {} r/w opens ===\n",
-            rows.len(),
-            self.opens_total
-        );
-        for r in &rows {
-            out.push_str(&r.to_string());
-            out.push('\n');
+
+        if self.walked_shares.is_empty() {
+            // No inventory: emit the pre-join table unchanged.
+            let mut out = format!(
+                "=== resolved heat: {} keys, {} r/w opens ===\n",
+                rows.len(),
+                self.opens_total
+            );
+            for r in &rows {
+                out.push_str(&r.to_string());
+                out.push('\n');
+            }
+            out.push_str(&format!("metadata-skipped: {}\n", self.metadata_skipped));
+            return out;
         }
+
+        let mut body = String::new();
+        let (mut leaves, mut restat, mut unresolved) = (0u64, 0u64, 0u64);
+        let (mut d_dir, mut d_root, mut d_nonwalked) = (0u64, 0u64, 0u64);
+        for r in &rows {
+            match classify_key(&r.share, &r.path, &self.inventory, &self.walked_shares) {
+                KeyOutcome::Leaf { alloc_bytes } => {
+                    leaves += 1;
+                    body.push_str(&fmt_join_row(r, Some(alloc_bytes), &[]));
+                }
+                KeyOutcome::Restat => {
+                    restat += 1;
+                    body.push_str(&fmt_join_row(r, None, &["restat"]));
+                }
+                KeyOutcome::UnresolvedShare => {
+                    unresolved += 1;
+                    body.push_str(&fmt_join_row(r, None, &["unresolved-share"]));
+                }
+                KeyOutcome::DropDir => d_dir += 1,
+                KeyOutcome::DropRoot => d_root += 1,
+                KeyOutcome::DropNonWalkedShare => d_nonwalked += 1,
+            }
+        }
+        let kept = leaves + restat + unresolved;
+        let mut out = format!(
+            "=== resolved heat: {} rows ({} leaves, {} restat, {} unresolved-share), {} r/w opens ===\n",
+            kept, leaves, restat, unresolved, self.opens_total
+        );
+        out.push_str(&format!(
+            "dropped: {} dir, {} share-root, {} non-walked-share\n",
+            d_dir, d_root, d_nonwalked
+        ));
+        out.push_str(&body);
         out.push_str(&format!("metadata-skipped: {}\n", self.metadata_skipped));
         out
     }
@@ -470,5 +607,67 @@ mod tests {
         e.apply(&open(OPEN_1, Some(SHARE_DATA), "\\f", READ), ft_day_a());
         e.apply(&open(OPEN_2, Some(SHARE_HOME), "\\f", READ), ft_day_a());
         assert_eq!(e.distinct_keys(), 2);
+    }
+
+    // --- emit-time bridge (pure classifier) -------------------------------
+
+    use crate::inventory::Entry;
+
+    fn inv_file(alloc: u64) -> Entry {
+        Entry { logical: alloc, alloc, is_dir: false, sparse: false, compressed: false }
+    }
+    fn inv_dir() -> Entry {
+        Entry { logical: 0, alloc: 0, is_dir: true, sparse: false, compressed: false }
+    }
+    fn walked(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_key_one_case_per_outcome() {
+        // Inventory keys are lowercased at load (as main does).
+        let mut inv = Inventory::new();
+        inv.insert(("heattest".into(), "folder3\\txtdoc4.txt".into()), inv_file(4096));
+        inv.insert(("heattest".into(), "folder3".into()), inv_dir());
+        let w = walked(&["heattest"]);
+
+        // leaf + bytes
+        assert_eq!(
+            classify_key("HeatTest", "folder3\\txtdoc4.txt", &inv, &w),
+            KeyOutcome::Leaf { alloc_bytes: 4096 }
+        );
+        // restat: walked share, path absent from inventory
+        assert_eq!(classify_key("HeatTest", "new.txt", &inv, &w), KeyOutcome::Restat);
+        // unresolved-share: no 600 bound the GUID (kept, not dropped)
+        assert_eq!(
+            classify_key(UNKNOWN_SHARE, "anything.txt", &inv, &w),
+            KeyOutcome::UnresolvedShare
+        );
+        // drop dir: authority is the inventory dir flag
+        assert_eq!(classify_key("HeatTest", "folder3", &inv, &w), KeyOutcome::DropDir);
+        // drop share-root: empty path
+        assert_eq!(classify_key("HeatTest", "", &inv, &w), KeyOutcome::DropRoot);
+        // drop non-walked share: how IPC$/admin shares fall out
+        assert_eq!(
+            classify_key("IPC$", "srvsvc", &inv, &w),
+            KeyOutcome::DropNonWalkedShare
+        );
+    }
+
+    #[test]
+    fn classify_key_sharename_is_case_insensitive() {
+        // Inventory + walked set lowercased at load; a 600-derived ShareName in
+        // any case still joins.
+        let mut inv = Inventory::new();
+        inv.insert(("heattest".into(), "a.txt".into()), inv_file(8192));
+        let w = walked(&["heattest"]);
+        assert_eq!(
+            classify_key("HEATTEST", "a.txt", &inv, &w),
+            KeyOutcome::Leaf { alloc_bytes: 8192 }
+        );
+        assert_eq!(
+            classify_key("HeAtTeSt", "a.txt", &inv, &w),
+            KeyOutcome::Leaf { alloc_bytes: 8192 }
+        );
     }
 }

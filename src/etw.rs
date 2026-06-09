@@ -11,6 +11,7 @@
 //! at all, that assumption is the first thing to check (and try setting the
 //! trace level to Informational explicitly — see below).
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use ferrisetw::parser::Parser;
@@ -21,6 +22,7 @@ use ferrisetw::EventRecord;
 
 use crate::correlation::CorrelationEngine;
 use crate::events::{self, DISCOVER_TARGETS};
+use crate::inventory::Inventory;
 
 pub const SMBSERVER_GUID: &str = "D48CE617-33A2-4BC3-A5C7-11AA4F29619E";
 const SESSION_NAME: &str = "SmbHeatSpike";
@@ -31,9 +33,21 @@ pub enum Mode {
     Resolve,
 }
 
-pub fn run(mode: Mode, mask: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Arc::new(Mutex::new(CorrelationEngine::default()));
+pub fn run(
+    mode: Mode,
+    mask: u64,
+    inventory: Inventory,
+    walked_shares: HashSet<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let no_inventory = walked_shares.is_empty();
+    let mut engine = CorrelationEngine::default();
+    engine.load_inventory(inventory, walked_shares);
+    let engine = Arc::new(Mutex::new(engine));
     let engine_cb = engine.clone();
+
+    if matches!(mode, Mode::Resolve) && no_inventory {
+        eprintln!("no inventory loaded; join skipped");
+    }
 
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         // Resolving the schema is what lets the Parser name-address fields.
