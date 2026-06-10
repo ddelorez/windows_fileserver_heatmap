@@ -6,19 +6,26 @@
 //!   smb-heat-spike resolve --rundown   # also enumerate pre-existing sessions/trees
 //!   smb-heat-spike resolve --share NAME=ROOT [--share ...]
 //!                                      # walk each ROOT and join file sizes at emit
+//!   smb-heat-spike resolve --flush-secs <secs>
+//!                                      # periodic flush cadence (default 300)
+//!   smb-heat-spike resolve --emit-dir <path>
+//!                                      # write each flush as NDJSON into <path>
+//!   smb-heat-spike resolve --collector <url>
+//!                                      # POST each flush's NDJSON to <url> (plain HTTP)
 //!   smb-heat-spike walk <Share> <dir>  # standalone file-size inventory of <dir>
 //!
 //! The ETW modes must run elevated (a real-time ETW session requires admin); the
 //! `walk` mode does not.
 
 mod correlation;
+mod emit;
 mod etw;
 mod events;
 mod identity;
 mod inventory;
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use etw::Mode;
 
@@ -66,7 +73,11 @@ fn main() {
         Mode::Discover => (inventory::Inventory::new(), HashSet::new()),
     };
 
-    if let Err(e) = etw::run(mode, mask, inventory, walked_shares) {
+    let flush_secs = parse_flush_secs(&args);
+    let emit_dir = parse_emit_dir(&args);
+    let collector = parse_collector(&args);
+
+    if let Err(e) = etw::run(mode, mask, inventory, walked_shares, flush_secs, emit_dir, collector) {
         eprintln!("error: {e}");
         eprintln!();
         eprintln!("if this is a session/ETW error, a previous run's session may be lingering:");
@@ -74,6 +85,67 @@ fn main() {
         eprintln!("  logman stop SmbHeatSpike -ets");
         std::process::exit(1);
     }
+}
+
+/// Parse `--collector <url>` — endpoint to POST each flush's NDJSON to. Absent ->
+/// `None` (no POST). Plain HTTP only (TLS is compiled out). A missing value
+/// aborts, matching `--share`'s style.
+fn parse_collector(args: &[String]) -> Option<String> {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--collector" {
+            let Some(url) = args.get(i + 1) else {
+                eprintln!("--collector needs a URL");
+                std::process::exit(2);
+            };
+            return Some(url.clone());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse `--emit-dir <path>` — directory for per-flush NDJSON files
+/// (`<run_id[..8]>-<seq>.ndjson`). Absent -> `None` (console-only). A missing
+/// value aborts, matching `--share`'s style.
+fn parse_emit_dir(args: &[String]) -> Option<PathBuf> {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--emit-dir" {
+            let Some(path) = args.get(i + 1) else {
+                eprintln!("--emit-dir needs a directory path");
+                std::process::exit(2);
+            };
+            return Some(PathBuf::from(path));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse `--flush-secs <secs>` — the periodic flush cadence in seconds; default
+/// 300. Only meaningful in resolve mode (the flusher runs there); harmless
+/// elsewhere. A missing value or non-integer aborts, matching `--share`'s style.
+fn parse_flush_secs(args: &[String]) -> u64 {
+    const DEFAULT_FLUSH_SECS: u64 = 300;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--flush-secs" {
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("--flush-secs needs a value in seconds");
+                std::process::exit(2);
+            };
+            match v.parse::<u64>() {
+                Ok(secs) => return secs,
+                Err(_) => {
+                    eprintln!("--flush-secs expects a non-negative integer, got '{v}'");
+                    std::process::exit(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    DEFAULT_FLUSH_SECS
 }
 
 /// Walk each `--share NAME=ROOT` pair (explicit allowlist; no Get-SmbShare) and

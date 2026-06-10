@@ -203,6 +203,22 @@ pub fn classify_key(
     }
 }
 
+/// One per-(share, path, day) row destined for the NDJSON emit. Plain data, no
+/// serde here — `src/emit.rs` owns the JSON framing. Mirrors the kept-key bridge
+/// in `resolved_table`: only Leaf/Restat/UnresolvedShare keys produce rows, with
+/// the NDJSON token set (`restat`, `unresolved_share`) and a lowercased share
+/// (`unknown` for an unbound ShareGUID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmitRow {
+    pub share: String,
+    pub path: String,
+    pub day: i32,
+    pub reads: u32,
+    pub writes: u32,
+    pub alloc_bytes: Option<u64>,
+    pub flags: Vec<&'static str>,
+}
+
 /// Format one kept join row. `alloc` is `None` for restat/unresolved (shown as
 /// `?`); `flags` are bracketed tokens placed before the `share_guid`.
 fn fmt_join_row(r: &HeatRow, alloc: Option<u64>, flags: &[&str]) -> String {
@@ -405,6 +421,56 @@ impl CorrelationEngine {
         out.push_str(&body);
         out.push_str(&format!("metadata-skipped: {}\n", self.metadata_skipped));
         out
+    }
+
+    /// The kept heat keys flattened to one row per (share, path, day), for the
+    /// NDJSON emit. Runs the SAME emit-time bridge as `resolved_table` (so the
+    /// NDJSON kept-key set equals the console kept-key set), then expands each
+    /// key's per-day BTreeMap into individual day rows. Dropped outcomes
+    /// (dir/share-root/non-walked-share) produce no rows. Sorted by
+    /// (share, path, day) for deterministic output.
+    pub fn emit_rows(&self) -> Vec<EmitRow> {
+        let mut rows: Vec<EmitRow> = Vec::new();
+        for ((sg, path), days) in &self.heat {
+            let share = self.resolve_name(*sg);
+            let (share_out, alloc, flags): (String, Option<u64>, Vec<&'static str>) =
+                match classify_key(&share, path, &self.inventory, &self.walked_shares) {
+                    KeyOutcome::Leaf { alloc_bytes } => (share.to_lowercase(), Some(alloc_bytes), vec![]),
+                    KeyOutcome::Restat => (share.to_lowercase(), None, vec!["restat"]),
+                    KeyOutcome::UnresolvedShare => {
+                        ("unknown".to_string(), None, vec!["unresolved_share"])
+                    }
+                    KeyOutcome::DropDir | KeyOutcome::DropRoot | KeyOutcome::DropNonWalkedShare => {
+                        continue
+                    }
+                };
+            // Each day entry is created only on a read/write open, so every entry
+            // has nonzero activity — day-row count per key == active_days.
+            for (day, dc) in days {
+                rows.push(EmitRow {
+                    share: share_out.clone(),
+                    path: path.clone(),
+                    day: *day,
+                    reads: dc.reads,
+                    writes: dc.writes,
+                    alloc_bytes: alloc,
+                    flags: flags.clone(),
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.share
+                .cmp(&b.share)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.day.cmp(&b.day))
+        });
+        rows
+    }
+
+    /// The walked-share allowlist (lowercased) as an unordered vec, for the emit
+    /// header. `emit::document` sorts it; order here is irrelevant.
+    pub fn walked_shares_vec(&self) -> Vec<String> {
+        self.walked_shares.iter().cloned().collect()
     }
 
     /// Per-day counts for a `(share_guid, path)` key (path is case-folded).
@@ -669,5 +735,63 @@ mod tests {
             classify_key("HeAtTeSt", "a.txt", &inv, &w),
             KeyOutcome::Leaf { alloc_bytes: 8192 }
         );
+    }
+
+    // --- emit_rows (per-day expansion of the kept-key bridge) --------------
+
+    #[test]
+    fn emit_rows_leaf_flattens_per_day_sorted() {
+        let mut inv = Inventory::new();
+        inv.insert(("heattest".into(), "folder3\\txtdoc4.txt".into()), inv_file(4096));
+        let mut e = CorrelationEngine::default();
+        e.load_inventory(inv, walked(&["heattest"]));
+        // 600 binds the GUID in mixed case; emit lowercases the share.
+        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "HeatTest".into() }, ft_day_a());
+        // Same key, two different days -> two rows, one per day.
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "folder3\\txtdoc4.txt", WRITE), ft_day_a());
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "folder3\\txtdoc4.txt", READ), ft_day_b());
+
+        let rows = e.emit_rows();
+        assert_eq!(rows.len(), 2);
+        // Sorted by day ascending (18642 before 18643).
+        assert_eq!(rows[0].day, 18642);
+        assert_eq!(rows[1].day, 18643);
+        assert_eq!(rows[0].share, "heattest");
+        assert_eq!(rows[0].path, "folder3\\txtdoc4.txt");
+        assert_eq!(rows[0].alloc_bytes, Some(4096));
+        assert!(rows[0].flags.is_empty());
+        // Per-day counts, NOT summed across days.
+        assert_eq!((rows[0].reads, rows[0].writes), (0, 1)); // day A: WRITE
+        assert_eq!((rows[1].reads, rows[1].writes), (1, 0)); // day B: READ
+    }
+
+    #[test]
+    fn emit_rows_restat_unresolved_kept_dir_dropped() {
+        let mut inv = Inventory::new();
+        inv.insert(("heattest".into(), "adir".into()), inv_dir());
+        let mut e = CorrelationEngine::default();
+        e.load_inventory(inv, walked(&["heattest"]));
+        e.apply(&SmbEvent::TreeConnect { share_guid: SHARE_DATA, share: "HeatTest".into() }, ft_day_a());
+        // restat: walked share, path absent from inventory.
+        e.apply(&open(OPEN_1, Some(SHARE_DATA), "missing.txt", READ), ft_day_a());
+        // dir: dropped on the inventory dir flag.
+        e.apply(&open(OPEN_2, Some(SHARE_DATA), "adir", WRITE), ft_day_a());
+        // unresolved-share: SHARE_HOME never bound by a 600.
+        e.apply(&open(OPEN_1, Some(SHARE_HOME), "orphan.txt", READ), ft_day_a());
+
+        let rows = e.emit_rows();
+        assert_eq!(rows.len(), 2); // dir dropped
+
+        let restat = rows.iter().find(|r| r.path == "missing.txt").expect("restat row");
+        assert_eq!(restat.share, "heattest");
+        assert_eq!(restat.alloc_bytes, None);
+        assert_eq!(restat.flags, vec!["restat"]);
+
+        let orphan = rows.iter().find(|r| r.path == "orphan.txt").expect("unresolved row");
+        assert_eq!(orphan.share, "unknown");
+        assert_eq!(orphan.alloc_bytes, None);
+        assert_eq!(orphan.flags, vec!["unresolved_share"]);
+
+        assert!(rows.iter().all(|r| r.path != "adir"), "dir key must not emit");
     }
 }

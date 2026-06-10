@@ -11,13 +11,25 @@ ferrisetw = "1.1"   # VERIFY: pin to the version actually on your dev VM; the ET
                     # small tweak to match the pinned version's examples.
 walkdir = "2.5.0"   # inventory walker (src/inventory.rs)
 # Pinned to 0.57 to match the windows crate ferrisetw already pulls in (no
-# duplicate copy). GetDiskFreeSpaceW lives in Win32_Storage_FileSystem.
-windows = { version = "0.57", features = ["Win32_Storage_FileSystem"] }
+# duplicate copy). GetDiskFreeSpaceW lives in Win32_Storage_FileSystem; UuidCreate
+# (run_id minting) lives in Win32_System_Rpc. Both are feature flags on the SAME
+# 0.57 crate — no second windows/windows-core version.
+windows = { version = "0.57", features = ["Win32_Storage_FileSystem", "Win32_System_Rpc"] }
 # Per-day demand bucketing in America/Chicago civil time. default-features=false
 # drops chrono's `clock` feature (and thus iana-time-zone, which would pull a
 # second windows-core) — we only do fixed-zone arithmetic, never Local::now().
+# NOTE: to_rfc3339 (emitted_at) needs only chrono's `alloc`, which `std` pulls in;
+# from_timestamp needs no feature — so the emit timestamp adds no `clock` exposure.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.9"
+# NDJSON emit framing (src/emit.rs). Both are pure (no windows dep); serde needs
+# `derive` for the internally-tagged line enum, serde_json's default `std` is fine.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# Collector POST (src/etw.rs). default-features=false drops the default `rustls`
+# + `gzip` — TLS off, plain HTTP only (collector is an internal http:// endpoint),
+# which also keeps the dep tree minimal (no rustls/ring/webpki) for the tree gate.
+ureq = { version = "3.3.0", default-features = false }
 
 [profile.release]
 opt-level = 3

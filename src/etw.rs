@@ -12,7 +12,11 @@
 //! trace level to Informational explicitly — see below).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
@@ -21,6 +25,7 @@ use ferrisetw::trace::{TraceTrait, UserTrace};
 use ferrisetw::EventRecord;
 
 use crate::correlation::CorrelationEngine;
+use crate::emit;
 use crate::events::{self, DISCOVER_TARGETS};
 use crate::inventory::Inventory;
 
@@ -38,6 +43,9 @@ pub fn run(
     mask: u64,
     inventory: Inventory,
     walked_shares: HashSet<String>,
+    flush_secs: u64,
+    emit_dir: Option<PathBuf>,
+    collector: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let no_inventory = walked_shares.is_empty();
     let mut engine = CorrelationEngine::default();
@@ -48,6 +56,33 @@ pub fn run(
     if matches!(mode, Mode::Resolve) && no_inventory {
         eprintln!("no inventory loaded; join skipped");
     }
+
+    // Only Resolve mode produces a heat-table dump, so only it runs a flusher.
+    // The flusher owns ALL flush output — the periodic console dump moves OFF the
+    // event-callback thread to here (no serialization/printing inside the callback
+    // anymore; that was the A1 hazard) — plus the flush-secs timer, the dump_seq,
+    // and (Step 2) the NDJSON emit. run_id/server are minted ONCE here at trace
+    // start so every dump in the run shares one identity. The callback only signals
+    // FlushNow when the 1000-open counter trips; main signals Stop on graceful
+    // shutdown and joins the flusher BEFORE returning, so `logman stop` can't race
+    // past the final flush.
+    let (flush_tx, flusher) = if matches!(mode, Mode::Resolve) {
+        let (tx, rx) = mpsc::channel::<FlushMsg>();
+        let ctx = FlushCtx {
+            engine: engine.clone(),
+            server: server_name(),
+            run_id: mint_run_id(),
+            walked_shares: engine.lock().unwrap().walked_shares_vec(),
+            emit_dir,
+            collector: collector.map(Collector::new),
+            dump_seq: 1,
+        };
+        let handle = thread::spawn(move || run_flusher(rx, ctx, flush_secs));
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+    let cb_tx = flush_tx.clone();
 
     let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         // Resolving the schema is what lets the Parser name-address fields.
@@ -73,13 +108,18 @@ pub fn run(
                     if eng.opens_total % 200 == 0 && eng.opens_total > 0 {
                         eprintln!("  [{}]", eng.stats_line());
                     }
-                    // Periodic full resolved-table dump. Ctrl+C on a busy server
-                    // is unreliable (and we can't reach a final flush after an
-                    // abrupt kill), so we keep a recent authoritative tally in
-                    // the stream — names resolved at dump time, so late 600s have
-                    // already named earlier opens.
-                    if eng.opens_total % 1000 == 0 && eng.opens_total > 0 {
-                        print!("{}", eng.resolved_table());
+                    // Periodic full resolved-table dump trigger. Ctrl+C on a busy
+                    // server is unreliable (and we can't reach a final flush after
+                    // an abrupt kill), so we keep a recent authoritative tally in
+                    // the stream. The dump itself runs on the flusher thread: we
+                    // compute the trip while holding the lock, RELEASE it, and only
+                    // then signal — no serialization/printing happens inline here.
+                    let trip = eng.opens_total % 1000 == 0 && eng.opens_total > 0;
+                    drop(eng);
+                    if trip {
+                        if let Some(tx) = &cb_tx {
+                            let _ = tx.send(FlushMsg::FlushNow);
+                        }
                     }
                 }
             }
@@ -103,17 +143,200 @@ pub fn run(
     // process via `start_and_process()` / `trace.process()`. Adjust to match.
     let status = UserTrace::process_from_handle(handle);
 
-    // Final flush on a graceful stop (trace end, or `logman stop SmbHeatSpike
-    // -ets`). An abrupt Ctrl+C kill won't reach here — the periodic dumps in the
-    // callback cover that case.
-    if let Mode::Resolve = mode {
-        let eng = engine.lock().unwrap();
-        print!("{}", eng.resolved_table());
+    // Graceful stop (trace end, or `logman stop SmbHeatSpike -ets`): tell the
+    // flusher to do its FINAL flush, then JOIN it before we return. The join is
+    // load-bearing — without it process exit could race past the last dump, which
+    // is the tail-loss the graceful-stop flush exists to prevent. An abrupt Ctrl+C
+    // kill won't reach here; the periodic dumps cover that case.
+    if let (Some(tx), Some(handle)) = (flush_tx, flusher) {
+        let _ = tx.send(FlushMsg::Stop);
+        let _ = handle.join();
     }
 
     status.map_err(|e| format!("ETW trace processing failed: {e:?}"))?;
 
     Ok(())
+}
+
+/// Messages from the event-callback thread (and main) to the flusher thread.
+enum FlushMsg {
+    /// The 1000-open counter tripped in the event callback.
+    FlushNow,
+    /// Graceful shutdown: do one final flush, then exit the loop.
+    Stop,
+}
+
+/// All flusher-thread-owned state: the engine handle, the run-scoped emit identity
+/// (`server`/`run_id`/`walked_shares`), the emit sink config, and the monotonic
+/// `dump_seq`.
+struct FlushCtx {
+    engine: Arc<Mutex<CorrelationEngine>>,
+    server: String,
+    run_id: String,
+    /// Walked-share allowlist (lowercased), for the NDJSON header.
+    walked_shares: Vec<String>,
+    /// `--emit-dir`: write each dump as `<run_id[..8]>-<seq>.ndjson` here.
+    emit_dir: Option<PathBuf>,
+    /// `--collector`: POST each dump's NDJSON here. Agent built once.
+    collector: Option<Collector>,
+    /// Starts at 1, increments on EVERY flush — even a failed write/POST — so seq
+    /// gaps in the emitted/received stream are a signal, not silent loss.
+    dump_seq: u32,
+}
+
+/// A configured collector endpoint: a reusable ureq agent + the target URL. TLS
+/// is compiled out (plain HTTP only); a ~10 s connect and ~10 s overall timeout
+/// are set so a stuck collector can't wedge the flusher indefinitely.
+struct Collector {
+    agent: ureq::Agent,
+    url: String,
+}
+
+impl Collector {
+    fn new(url: String) -> Self {
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build();
+        Collector { agent: ureq::Agent::new_with_config(config), url }
+    }
+}
+
+/// The flusher thread. Owns the flush-secs timer and ALL flush output. Wakes on
+/// whichever comes first — a FlushNow/Stop message or the timer deadline — flushes,
+/// and resets the deadline. Stop (or a disconnected channel) does a final flush
+/// and exits, so main's join returns only after the tail has been emitted.
+fn run_flusher(rx: Receiver<FlushMsg>, mut ctx: FlushCtx, flush_secs: u64) {
+    // If emitting to files, make sure the directory exists once up front rather
+    // than failing (and logging) on every flush.
+    if let Some(dir) = &ctx.emit_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("emit: cannot create --emit-dir {}: {e}", dir.display());
+        }
+    }
+
+    let interval = Duration::from_secs(flush_secs);
+    let mut next = Instant::now() + interval;
+    loop {
+        let timeout = next.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(timeout) {
+            Ok(FlushMsg::FlushNow) | Err(RecvTimeoutError::Timeout) => {
+                ctx.flush();
+                next = Instant::now() + interval;
+            }
+            Ok(FlushMsg::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                ctx.flush();
+                break;
+            }
+        }
+    }
+}
+
+impl FlushCtx {
+    /// One flush. Snapshot under the lock (console string + emit rows from the
+    /// SAME snapshot), RELEASE the lock, then write output with no lock held. The
+    /// console dump content/format is unchanged; NDJSON is built only when a sink
+    /// wants it. `dump_seq` always advances afterward.
+    fn flush(&mut self) {
+        // Only pay for NDJSON when a sink consumes it (--emit-dir and/or --collector).
+        let want_ndjson = self.emit_dir.is_some() || self.collector.is_some();
+        // Stamp emitted_at outside the lock so the lock hold stays minimal.
+        let emitted_at = if want_ndjson { rfc3339_now() } else { String::new() };
+
+        let (console, ndjson) = {
+            let eng = self.engine.lock().unwrap();
+            let console = eng.resolved_table();
+            let ndjson = want_ndjson.then(|| {
+                let rows = eng.emit_rows();
+                let meta = emit::Meta {
+                    server: &self.server,
+                    run_id: &self.run_id,
+                    dump_seq: self.dump_seq,
+                    emitted_at: &emitted_at,
+                    walked_shares: &self.walked_shares,
+                };
+                emit::document(&meta, &rows)
+            });
+            (console, ndjson)
+        };
+
+        // The console dump remains the primary live-verification surface. Both the
+        // file write and the POST run with NO lock held, on the SAME `doc`.
+        print!("{console}");
+        if let Some(doc) = ndjson {
+            self.write_emit_dir(&doc);
+            self.post_collector(&doc);
+        }
+
+        // Increment unconditionally — a failed write/POST above must not stall the
+        // seq, so gaps stay meaningful.
+        self.dump_seq += 1;
+    }
+
+    /// Write one dump to `<emit_dir>/<run_id[..8]>-<seq>.ndjson`. The filename
+    /// stem is the first 8 hex of the run_id (the first hyphen sits at index 8, so
+    /// the stem never includes it); the header still carries the full run_id.
+    fn write_emit_dir(&self, doc: &str) {
+        let Some(dir) = &self.emit_dir else { return };
+        let stem = &self.run_id[..8];
+        let path = dir.join(format!("{stem}-{}.ndjson", self.dump_seq));
+        if let Err(e) = std::fs::write(&path, doc) {
+            eprintln!("emit: failed to write {}: {e}", path.display());
+        }
+    }
+
+    /// POST one dump's NDJSON to the collector, if configured. ureq treats non-2xx
+    /// as an error by default, so any failure — connect, timeout, or HTTP status —
+    /// lands in one log line carrying this dump's seq; then we drop it and carry on
+    /// (no retry, no spool). Success logs one terse line to stderr so stdout (the
+    /// console dump) stays clean.
+    fn post_collector(&self, doc: &str) {
+        let Some(c) = &self.collector else { return };
+        match c
+            .agent
+            .post(c.url.as_str())
+            .header("Content-Type", "application/x-ndjson")
+            .send(doc)
+        {
+            Ok(resp) => eprintln!("emit: POST dump_seq={} -> {}", self.dump_seq, resp.status().as_u16()),
+            Err(e) => eprintln!("emit: POST dump_seq={} failed: {e}", self.dump_seq),
+        }
+    }
+}
+
+/// Mint the run_id once at trace start via the RPC `UuidCreate`, formatted as a
+/// hyphenated lowercase UUID by hand from the GUID fields. `UuidCreate` returns
+/// `RPC_S_OK` or the non-fatal `RPC_S_UUID_LOCAL_ONLY` (still a usable, locally
+/// unique value), so the status is intentionally ignored.
+fn mint_run_id() -> String {
+    let mut g = windows::core::GUID::default();
+    // SAFETY: UuidCreate only writes a UUID into the pointed-to GUID.
+    unsafe {
+        let _ = windows::Win32::System::Rpc::UuidCreate(&mut g);
+    }
+    let d = g.data4;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        g.data1, g.data2, g.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+    )
+}
+
+/// The reporting server name: `%COMPUTERNAME%` lowercased (no API call). Empty if
+/// the variable is somehow unset.
+fn server_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default().to_lowercase()
+}
+
+/// `emitted_at` for an NDJSON header: wall-clock now as RFC3339 UTC. SystemTime ->
+/// duration since UNIX_EPOCH -> chrono `from_timestamp` -> `to_rfc3339` (no `clock`
+/// feature, so no iana-time-zone). Pre-epoch clocks fall back to the epoch.
+fn rfc3339_now() -> String {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    chrono::DateTime::from_timestamp(since.as_secs() as i64, since.subsec_nanos())
+        .unwrap_or_default()
+        .to_rfc3339()
 }
 
 /// Discover mode: print one line per record, prefixed by the event id, so that
