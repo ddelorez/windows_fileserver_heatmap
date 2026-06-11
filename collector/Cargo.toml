@@ -1,0 +1,25 @@
+[package]
+name = "collector"
+version = "0.1.0"
+edition = "2021"
+description = "Heat-spike collector skeleton: HTTP ingest + raw-dump archive (no database yet)"
+
+# Deliberately NOT a Cargo workspace member: this crate has its own Cargo.toml,
+# Cargo.lock, and target/. There is no root Cargo.toml. The agent/ crate is
+# Windows-only and unrelated to this Linux binary.
+[dependencies]
+# Blocking, std-thread HTTP server. No async runtime, no web framework — the
+# accept loop runs on the main thread and handles each request inline. Pinned
+# provisionally; the dependency tree gets a manual audit before this is final.
+tiny_http = "0.12"
+# NDJSON line parsing only. `derive` is for the header/line structs.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+# Filesystem tests for the archive writer (dir creation + idempotent overwrite).
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
