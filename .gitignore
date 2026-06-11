@@ -7,3 +7,5 @@ target/
 
 # MSVC debug symbols
 *.pdb
+archive/
+*.duckdb
