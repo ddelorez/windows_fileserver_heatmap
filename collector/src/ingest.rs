@@ -13,11 +13,12 @@
 
 use serde::Deserialize;
 
-/// The naming-relevant header fields. `emitted_at` and `walked_shares` are part
-/// of the wire format but the skeleton does not act on them, so they are not
-/// deserialized. `server`/`run_id`/`dump_seq` are `Option` so a *missing* field
-/// is distinguishable from a *wrong-typed* one: a missing field lands as `None`
-/// (a clean "missing" rejection), while a wrong type fails `from_str` outright.
+/// The header fields we read. `walked_shares` is part of the wire format but we
+/// don't act on it, so it is not deserialized. `server`/`run_id`/`dump_seq` are
+/// `Option` so a *missing* field is distinguishable from a *wrong-typed* one: a
+/// missing field lands as `None` (a clean "missing" rejection), while a wrong
+/// type fails `from_str` outright. `emitted_at` is optional at parse time (its
+/// absence does not change step-2 classification); the db layer requires it.
 #[derive(Debug, Deserialize)]
 struct RawHeader {
     #[serde(rename = "type")]
@@ -25,15 +26,34 @@ struct RawHeader {
     server: Option<String>,
     run_id: Option<String>,
     dump_seq: Option<u32>,
+    emitted_at: Option<String>,
 }
 
 /// A parsed, present-and-typed header. The field *values* are not yet validated
-/// as safe path components — that is [`validate_naming`]'s job.
+/// as safe path components — that is [`validate_naming`]'s job. `emitted_at` is
+/// carried through to the db layer (first_seen/last_seen/started_at); it is
+/// `Option` because step-2 classification never gated on it.
 #[derive(Debug, Clone)]
 pub struct Header {
     pub server: String,
     pub run_id: String,
     pub dump_seq: u32,
+    pub emitted_at: Option<String>,
+}
+
+/// One fully-parsed `row` line. Parsed ONCE here (during classify) and handed to
+/// the db layer in `Disposition::Accepted` — db.rs never re-parses the body.
+/// `day` is the agent's raw `i32` day-index; `alloc_bytes` is `None` for a JSON
+/// `null` (e.g. a restat row); `flags` defaults to empty if the key is absent.
+#[derive(Debug, Clone)]
+pub struct DumpRow {
+    pub share: String,
+    pub path: String,
+    pub day: i32,
+    pub reads: u32,
+    pub writes: u32,
+    pub alloc_bytes: Option<u64>,
+    pub flags: Vec<String>,
 }
 
 /// What one request resolves to, before any I/O. The `main.rs` tail turns this
@@ -47,7 +67,8 @@ pub enum Disposition {
     /// real per-server path), but the row/footer framing is broken. 400.
     Rejected { header: Header, reason: String },
     /// Fully valid document. Archive to the per-server path and respond 200.
-    Accepted { header: Header, rows: usize },
+    /// Carries the parsed rows so the db layer ingests without re-parsing.
+    Accepted { header: Header, rows: Vec<DumpRow> },
 }
 
 /// Classify a raw request body into a [`Disposition`] — the single pure entry
@@ -74,7 +95,7 @@ pub fn classify(body: &[u8]) -> Disposition {
         return Disposition::Malformed { reason };
     }
 
-    match validate_body_lines(&lines[1..]) {
+    match parse_body_lines(&lines[1..]) {
         Ok(rows) => Disposition::Accepted { header, rows },
         Err(reason) => Disposition::Rejected { header, reason },
     }
@@ -103,7 +124,7 @@ pub fn parse_header(line: &str) -> Result<Header, String> {
     let server = raw.server.ok_or("header missing \"server\"")?;
     let run_id = raw.run_id.ok_or("header missing \"run_id\"")?;
     let dump_seq = raw.dump_seq.ok_or("header missing \"dump_seq\"")?;
-    Ok(Header { server, run_id, dump_seq })
+    Ok(Header { server, run_id, dump_seq, emitted_at: raw.emitted_at })
 }
 
 /// Step 3: validate the naming fields *before* they are used as filesystem path
@@ -157,58 +178,91 @@ pub fn archive_rel_path(server: &str, run_id: &str, dump_seq: u32) -> String {
     format!("{server}/{prefix}-{dump_seq}.ndjson")
 }
 
-/// Step 5: validate the post-header lines. Each must be valid JSON of type
-/// `"row"` or `"footer"`; there must be exactly one footer; it must be the last
-/// line; and `footer.rows` must equal the number of row lines. Returns the row
-/// count on success. An empty slice (header with no footer) is a missing-footer
-/// rejection; a lone `{"type":"footer","rows":0}` (empty dump) is accepted.
-pub fn validate_body_lines(lines: &[&str]) -> Result<usize, String> {
-    let mut row_count = 0usize;
+/// One post-header line, fully parsed by `type`. An internally-tagged enum: a
+/// line whose `type` is neither `row` nor `footer` fails to deserialize (unknown
+/// variant), and a `row` line missing a required field fails too — both surface
+/// as a rejection. This is a slight tightening over step 2 (which only checked
+/// the `type` tag and framing): a malformed-but-typed row that step 2 accepted
+/// now lands as `Rejected`. The archive location is unchanged (header is valid,
+/// so still the per-server path); only the status flips 200 -> 400 for that
+/// edge. Real agent dumps always carry complete rows.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum BodyLine {
+    Row {
+        share: String,
+        path: String,
+        day: i32,
+        reads: u32,
+        writes: u32,
+        alloc_bytes: Option<u64>,
+        #[serde(default)]
+        flags: Vec<String>,
+    },
+    Footer {
+        rows: usize,
+    },
+}
+
+/// Step 5: parse + validate the post-header lines. Each must be a valid JSON
+/// `row` or `footer`; there must be exactly one footer; it must be the last
+/// line; and `footer.rows` must equal the number of row lines. Returns the
+/// parsed rows on success. An empty slice (header with no footer) is a
+/// missing-footer rejection; a lone `{"type":"footer","rows":0}` (empty dump)
+/// yields an empty row vec.
+pub fn parse_body_lines(lines: &[&str]) -> Result<Vec<DumpRow>, String> {
+    let mut rows: Vec<DumpRow> = Vec::new();
     let mut footer_rows: Option<usize> = None;
     let n = lines.len();
 
     for (i, line) in lines.iter().enumerate() {
         // +2: 1-based line number, and the header was line 1.
         let lineno = i + 2;
-        let parsed: RawLine = serde_json::from_str(line)
-            .map_err(|e| format!("line {lineno} is not valid JSON: {e}"))?;
-        match parsed.kind.as_str() {
-            "row" => {
+        let parsed: BodyLine = serde_json::from_str(line)
+            .map_err(|e| format!("line {lineno} is not a valid row/footer: {e}"))?;
+        match parsed {
+            BodyLine::Row {
+                share,
+                path,
+                day,
+                reads,
+                writes,
+                alloc_bytes,
+                flags,
+            } => {
                 if footer_rows.is_some() {
                     return Err(format!("row on line {lineno} follows the footer"));
                 }
-                row_count += 1;
+                rows.push(DumpRow {
+                    share,
+                    path,
+                    day,
+                    reads,
+                    writes,
+                    alloc_bytes,
+                    flags,
+                });
             }
-            "footer" => {
+            BodyLine::Footer { rows: declared } => {
                 if footer_rows.is_some() {
                     return Err("more than one footer".into());
                 }
                 if i != n - 1 {
                     return Err("footer is not the last line".into());
                 }
-                footer_rows = Some(parsed.rows.ok_or("footer missing \"rows\"")?);
+                footer_rows = Some(declared);
             }
-            other => return Err(format!("line {lineno} has unexpected type {other:?}")),
         }
     }
 
     match footer_rows {
         None => Err("missing footer".into()),
-        Some(declared) if declared != row_count => {
-            Err(format!("footer rows={declared} but counted {row_count} row lines"))
-        }
-        Some(_) => Ok(row_count),
+        Some(declared) if declared != rows.len() => Err(format!(
+            "footer rows={declared} but counted {} row lines",
+            rows.len()
+        )),
+        Some(_) => Ok(rows),
     }
-}
-
-/// A post-header line, parsed for framing only. Unknown fields (a row's
-/// `share`/`path`/… or `walked_shares`) are ignored; `rows` is read only when
-/// `kind == "footer"`.
-#[derive(Deserialize)]
-struct RawLine {
-    #[serde(rename = "type")]
-    kind: String,
-    rows: Option<usize>,
 }
 
 /// First 8 characters of a run_id for logging (never used to build a path).
@@ -291,42 +345,58 @@ mod tests {
     fn rows_mismatch_rejected() {
         let r = row("a.txt");
         let lines = vec![r.as_str(), r#"{"type":"footer","rows":2}"#];
-        assert!(validate_body_lines(&lines).is_err());
+        assert!(parse_body_lines(&lines).is_err());
     }
 
     #[test]
     fn footer_not_last_rejected() {
         let r = row("a.txt");
         let lines = vec![r#"{"type":"footer","rows":1}"#, r.as_str()];
-        assert!(validate_body_lines(&lines).is_err());
+        assert!(parse_body_lines(&lines).is_err());
     }
 
     #[test]
     fn missing_footer_rejected() {
         let r = row("a.txt");
         let lines = vec![r.as_str()];
-        assert!(validate_body_lines(&lines).is_err());
+        assert!(parse_body_lines(&lines).is_err());
     }
 
     #[test]
     fn empty_dump_accepted() {
         // rows == 0 with no row lines is a legal empty dump.
         let lines = vec![r#"{"type":"footer","rows":0}"#];
-        assert_eq!(validate_body_lines(&lines).unwrap(), 0);
+        assert!(parse_body_lines(&lines).unwrap().is_empty());
     }
 
     #[test]
-    fn matching_rows_accepted() {
+    fn matching_rows_parsed() {
         let r1 = row("a.txt");
         let r2 = row("b.txt");
         let lines = vec![r1.as_str(), r2.as_str(), r#"{"type":"footer","rows":2}"#];
-        assert_eq!(validate_body_lines(&lines).unwrap(), 2);
+        let parsed = parse_body_lines(&lines).unwrap();
+        assert_eq!(parsed.len(), 2);
+        // Fields round-trip from the JSON row helper.
+        assert_eq!(parsed[0].path, "a.txt");
+        assert_eq!(parsed[0].day, 20613);
+        assert_eq!(parsed[0].reads, 1);
+        assert_eq!(parsed[0].alloc_bytes, Some(10));
     }
 
     #[test]
     fn invalid_json_row_rejected() {
         let lines = vec!["{not json", r#"{"type":"footer","rows":1}"#];
-        assert!(validate_body_lines(&lines).is_err());
+        assert!(parse_body_lines(&lines).is_err());
+    }
+
+    #[test]
+    fn null_alloc_and_flags_parse() {
+        // A restat-style row: alloc_bytes null, a flag present.
+        let line = r#"{"type":"row","share":"data","path":"x.txt","day":1,"reads":1,"writes":0,"alloc_bytes":null,"flags":["restat"]}"#;
+        let lines = vec![line, r#"{"type":"footer","rows":1}"#];
+        let parsed = parse_body_lines(&lines).unwrap();
+        assert_eq!(parsed[0].alloc_bytes, None);
+        assert_eq!(parsed[0].flags, vec!["restat".to_string()]);
     }
 
     // ---- end-to-end classify (still pure: bytes in, Disposition out) -------
@@ -342,7 +412,7 @@ mod tests {
         match classify(body.as_bytes()) {
             Disposition::Accepted { header, rows } => {
                 assert_eq!(header.server, "sgifs01");
-                assert_eq!(rows, 1);
+                assert_eq!(rows.len(), 1);
             }
             other => panic!("expected Accepted, got {other:?}"),
         }

@@ -1,30 +1,33 @@
-//! collector — heat-spike server skeleton.
+//! collector — heat-spike server.
 //!
-//! A single Linux binary that listens for NDJSON dumps from the Windows agents
-//! and archives each raw body to disk. THIS is the skeleton only: an HTTP
-//! listener (`POST /ingest`) and a raw-dump archive. There is no database, no
-//! query endpoint, and no transform of the rows — parsing of the row/footer
-//! lines is validation-only. DuckDB arrives in a later step.
+//! A single Linux binary that listens for NDJSON dumps from the Windows agents,
+//! archives each raw body to disk, and (when `--db` is given) ingests accepted
+//! dumps into an embedded DuckDB file. The raw archive is written FIRST and
+//! unconditionally — it is the inspectable record and the replay source — then
+//! the parsed dump is applied to the database in one transaction.
 //!
 //! Usage:
-//!   collector [--bind <ip:port>] [--archive-dir <path>]
+//!   collector [--bind <ip:port>] [--archive-dir <path>] [--db <path>]
 //!     --bind <ip:port>      listen address      (default 0.0.0.0:2742)
 //!     --archive-dir <path>  raw-dump archive    (default ./archive)
+//!     --db <path>           DuckDB file; OMITTED => archive-only mode
 //!
 //! Concurrency: tiny_http's accept loop runs on the main thread and each
 //! request is handled inline (sequential). Three agents on 5-minute timers are
 //! near-zero concurrency, and sequential handling is the single-writer
-//! discipline the design wants when the database lands next step.
+//! discipline the database wants (the connection is a `Mutex<Connection>`).
 
 mod archive;
+mod db;
 mod ingest;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tiny_http::{Method, Request, Response, Server};
 
+use db::{Db, IngestOutcome};
 use ingest::Disposition;
 
 /// Sanity cap against a runaway client — not a tuning parameter. Bodies larger
@@ -38,6 +41,33 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bind = parse_bind(&args);
     let archive_dir = parse_archive_dir(&args);
+    let db_path = parse_db(&args);
+
+    // Open the database up front (when requested) so a bad path / unreadable
+    // file fails fast at startup rather than on the first dump.
+    let db: Option<Db> = match &db_path {
+        Some(path) => match Db::open(path) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("failed to open db {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // Display tokens for the startup marker and per-request log lines.
+    let db_disp = db_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let engine_disp = db.as_ref().map(Db::engine_version).unwrap_or("none");
+    // Per-request "db=" token is the file name only (or "none").
+    let db_token = db_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "none".to_string());
 
     let server = match Server::http(&bind) {
         Ok(s) => s,
@@ -46,25 +76,57 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!(
-        "collector listening on {bind}, archiving to {}",
-        archive_dir.display()
-    );
+
+    // Noisy-mode startup marker: one line to stderr and one appended to
+    // <archive-dir>/_startup.log (best-effort; archive writes surface dir
+    // problems later if this fails).
+    let ts = rfc3339_utc(unix_now().as_secs() as i64);
+    if db.is_some() {
+        eprintln!(
+            "collector listening on {bind}, archive {}, db {db_disp} (engine {engine_disp})",
+            archive_dir.display()
+        );
+    } else {
+        eprintln!(
+            "collector listening on {bind}, archive {} (archive-only, no db)",
+            archive_dir.display()
+        );
+    }
+    append_startup_log(&archive_dir, &ts, &bind, &db_disp, engine_disp);
 
     // Accept loop on the main thread; handle each request inline (no per-request
     // threads — see the module doc comment).
     for request in server.incoming_requests() {
-        handle(request, &archive_dir);
+        handle(request, &archive_dir, db.as_ref(), &db_token);
     }
 }
 
-/// Handle one request end to end: route, read (capped), classify, archive, log,
-/// respond. Every path logs exactly one stdout line and sends exactly one
-/// response.
-fn handle(mut request: Request, archive_dir: &Path) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+/// Append one startup marker to `<archive-dir>/_startup.log`, creating the dir
+/// and file as needed. Best-effort: a failure is logged to stderr, not fatal.
+fn append_startup_log(archive_dir: &Path, ts: &str, bind: &str, db: &str, engine: &str) {
+    if let Err(e) = std::fs::create_dir_all(archive_dir) {
+        eprintln!("warning: could not create archive dir for _startup.log: {e}");
+        return;
+    }
+    let line = format!(
+        "{ts} bind={bind} archive={} db={db} engine={engine}\n",
+        archive_dir.display()
+    );
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(archive_dir.join("_startup.log"))
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+    if let Err(e) = res {
+        eprintln!("warning: could not write _startup.log: {e}");
+    }
+}
+
+/// Handle one request end to end: route, read (capped), classify, archive,
+/// (optionally) ingest into the db, log, respond. Every path logs exactly one
+/// stdout line (carrying a `db=` token) and sends exactly one response.
+fn handle(mut request: Request, archive_dir: &Path, db: Option<&Db>, db_token: &str) {
+    let now = unix_now();
     let ts = rfc3339_utc(now.as_secs() as i64);
     let ip = request
         .remote_addr()
@@ -75,7 +137,7 @@ fn handle(mut request: Request, archive_dir: &Path) {
     let path = request.url().split('?').next().unwrap_or("").to_string();
     let is_ingest = *request.method() == Method::Post && path == "/ingest";
     if !is_ingest {
-        log_line(&ts, &ip, "-", "-", "-", "-", 404, "no route");
+        log_line(&ts, &ip, "-", "-", "-", "-", 404, "no route", db_token);
         let _ = request.respond(Response::empty(404));
         return;
     }
@@ -87,13 +149,13 @@ fn handle(mut request: Request, archive_dir: &Path) {
         .take(MAX_BODY as u64 + 1)
         .read_to_end(&mut body)
     {
-        log_line(&ts, &ip, "-", "-", "-", "-", 400, "body read error");
+        log_line(&ts, &ip, "-", "-", "-", "-", 400, "body read error", db_token);
         let _ = request.respond(Response::from_string(format!("read error: {e}")).with_status_code(400));
         return;
     }
     if body.len() > MAX_BODY {
         // Rejected before archiving — the archive should not hold a runaway body.
-        log_line(&ts, &ip, "-", "-", "-", "-", 400, "body exceeds 256 MiB");
+        log_line(&ts, &ip, "-", "-", "-", "-", 400, "body exceeds 256 MiB", db_token);
         let _ = request.respond(Response::from_string("body exceeds 256 MiB").with_status_code(400));
         return;
     }
@@ -115,7 +177,7 @@ fn handle(mut request: Request, archive_dir: &Path) {
     // report it as 500 and keep the identity fields we managed to parse.
     if let Err(e) = archived {
         let (server, run, seq) = log_identity(&disposition);
-        log_line(&ts, &ip, &server, &run, &seq, "-", 500, &format!("archive failed: {e}"));
+        log_line(&ts, &ip, &server, &run, &seq, "-", 500, &format!("archive failed: {e}"), db_token);
         let _ = request.respond(Response::from_string("archive write failed").with_status_code(500));
         return;
     }
@@ -124,16 +186,38 @@ fn handle(mut request: Request, archive_dir: &Path) {
     let (server, run, seq) = log_identity(&disposition);
     match &disposition {
         Disposition::Malformed { reason } => {
-            log_line(&ts, &ip, &server, &run, &seq, "-", 400, reason);
+            log_line(&ts, &ip, &server, &run, &seq, "-", 400, reason, db_token);
             let _ = request.respond(Response::from_string(reason.clone()).with_status_code(400));
         }
         Disposition::Rejected { reason, .. } => {
-            log_line(&ts, &ip, &server, &run, &seq, "-", 400, reason);
+            log_line(&ts, &ip, &server, &run, &seq, "-", 400, reason, db_token);
             let _ = request.respond(Response::from_string(reason.clone()).with_status_code(400));
         }
-        Disposition::Accepted { rows, .. } => {
-            log_line(&ts, &ip, &server, &run, &seq, &rows.to_string(), 200, "ok");
-            let _ = request.respond(Response::empty(200));
+        Disposition::Accepted { header, rows } => {
+            let n = rows.len().to_string();
+            match db {
+                // Archive-only mode: step-2 behavior preserved exactly.
+                None => {
+                    log_line(&ts, &ip, &server, &run, &seq, &n, 200, "ok", db_token);
+                    let _ = request.respond(Response::empty(200));
+                }
+                // DB mode: ingest the parsed dump (archive already written).
+                Some(db) => match db.ingest(header, rows) {
+                    Ok(IngestOutcome::Accepted) => {
+                        log_line(&ts, &ip, &server, &run, &seq, &n, 200, "accepted", db_token);
+                        let _ = request.respond(Response::empty(200));
+                    }
+                    Ok(IngestOutcome::DedupeNoop) => {
+                        log_line(&ts, &ip, &server, &run, &seq, &n, 200, "dedupe-noop", db_token);
+                        let _ = request.respond(Response::empty(200));
+                    }
+                    // Body is already archived — the archive is the replay source.
+                    Err(e) => {
+                        log_line(&ts, &ip, &server, &run, &seq, &n, 500, &format!("db error: {e}"), db_token);
+                        let _ = request.respond(Response::from_string("db ingest failed").with_status_code(500));
+                    }
+                },
+            }
         }
     }
 }
@@ -152,8 +236,9 @@ fn log_identity(d: &Disposition) -> (String, String, String) {
 }
 
 /// One stdout line per request: RFC3339 time, client IP, server, run_id (first
-/// 8), dump_seq, row count, HTTP status, and a short reason. Fields use `key=`
-/// prefixes so the line is greppable; `"-"` marks a value we do not have.
+/// 8), dump_seq, row count, HTTP status, a short reason, and the db file in use
+/// (`none` in archive-only mode). Fields use `key=` prefixes so the line is
+/// greppable; `"-"` marks a value we do not have.
 fn log_line(
     ts: &str,
     ip: &str,
@@ -163,9 +248,10 @@ fn log_line(
     rows: &str,
     status: u16,
     reason: &str,
+    db: &str,
 ) {
     println!(
-        "{ts} ip={ip} server={server} run={run} seq={seq} rows={rows} status={status} reason={reason}"
+        "{ts} ip={ip} server={server} run={run} seq={seq} rows={rows} status={status} reason={reason} db={db}"
     );
 }
 
@@ -183,6 +269,12 @@ fn parse_archive_dir(args: &[String]) -> PathBuf {
     parse_value(args, "--archive-dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_ARCHIVE_DIR))
+}
+
+/// Parse `--db <path>`; OPTIONAL. Absent => `None` => archive-only mode. A
+/// present flag with no value aborts (matching the other flags' style).
+fn parse_db(args: &[String]) -> Option<PathBuf> {
+    parse_value(args, "--db").map(PathBuf::from)
 }
 
 /// Find `<flag> <value>` in args, returning the value. A flag with no following
@@ -205,6 +297,13 @@ fn parse_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 // ---- time -----------------------------------------------------------------
+
+/// Duration since the Unix epoch (saturating to 0 on a pre-epoch clock).
+fn unix_now() -> std::time::Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+}
 
 /// Format unix `secs` as RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`). Hand-rolled from
 /// `SystemTime` so the crate needs no date library — the only timestamps we
@@ -248,6 +347,7 @@ mod tests {
         let none: Vec<String> = vec!["collector".into()];
         assert_eq!(parse_bind(&none), DEFAULT_BIND);
         assert_eq!(parse_archive_dir(&none), PathBuf::from(DEFAULT_ARCHIVE_DIR));
+        assert_eq!(parse_db(&none), None); // archive-only by default
 
         let some: Vec<String> = vec![
             "collector".into(),
@@ -255,8 +355,11 @@ mod tests {
             "127.0.0.1:9999".into(),
             "--archive-dir".into(),
             "/srv/dumps".into(),
+            "--db".into(),
+            "/srv/heat.duckdb".into(),
         ];
         assert_eq!(parse_bind(&some), "127.0.0.1:9999");
         assert_eq!(parse_archive_dir(&some), PathBuf::from("/srv/dumps"));
+        assert_eq!(parse_db(&some), Some(PathBuf::from("/srv/heat.duckdb")));
     }
 }

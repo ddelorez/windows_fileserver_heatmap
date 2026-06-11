@@ -2,7 +2,7 @@
 name = "collector"
 version = "0.1.0"
 edition = "2021"
-description = "Heat-spike collector skeleton: HTTP ingest + raw-dump archive (no database yet)"
+description = "Heat-spike collector: HTTP ingest + raw-dump archive + optional DuckDB store"
 
 # Deliberately NOT a Cargo workspace member: this crate has its own Cargo.toml,
 # Cargo.lock, and target/. There is no root Cargo.toml. The agent/ crate is
@@ -15,6 +15,10 @@ tiny_http = "0.12"
 # NDJSON line parsing only. `derive` is for the header/line structs.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Embedded analytical DB. "bundled" compiles libduckdb from source (no system
+# lib), so the first build is slow but the binary is self-contained. Pinned to
+# the exact audited version (1.10503.1) so the dependency tree is reproducible.
+duckdb = { version = "1.10503.1", features = ["bundled"] }
 
 [dev-dependencies]
 # Filesystem tests for the archive writer (dir creation + idempotent overwrite).
