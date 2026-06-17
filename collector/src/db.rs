@@ -133,6 +133,15 @@ impl Db {
         &self.engine_version
     }
 
+    /// Lock the single connection for a READ query. Read endpoints
+    /// (`query.rs`) go through this same `Mutex<Connection>` as ingest — no
+    /// second connection, no readonly attach — so the single-writer discipline
+    /// and serialized access are preserved. A poisoned lock (a prior handler
+    /// panicked mid-transaction) is recovered, matching `ingest`.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Ingest one ACCEPTED dump in a single transaction. Called AFTER the body
     /// has been archived (archive-first order is unchanged). Sequence:
     ///   1. dedupe gate on `runs.last_dump_seq`,

@@ -20,15 +20,21 @@
 mod archive;
 mod db;
 mod ingest;
+mod query;
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tiny_http::{Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 use db::{Db, IngestOutcome};
 use ingest::Disposition;
+
+// ---- embedded UI (include_str!: no build step, no CDN, no framework) -------
+const INDEX_HTML: &str = include_str!("ui/index.html");
+const APP_JS: &str = include_str!("ui/app.js");
+const STYLE_CSS: &str = include_str!("ui/style.css");
 
 /// Sanity cap against a runaway client — not a tuning parameter. Bodies larger
 /// than this are rejected with 400 before anything is archived.
@@ -42,6 +48,7 @@ fn main() {
     let bind = parse_bind(&args);
     let archive_dir = parse_archive_dir(&args);
     let db_path = parse_db(&args);
+    let tier_log = parse_tier_log(&args);
 
     // Open the database up front (when requested) so a bad path / unreadable
     // file fails fast at startup rather than on the first dump.
@@ -68,6 +75,13 @@ fn main() {
         .and_then(|p| p.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "none".to_string());
+    // Startup display for the tier-log: the configured path, or "missing" when
+    // the flag was not given. (Per-request the file's existence is re-checked;
+    // an absent file yields NULL tier columns rather than an error.)
+    let tier_log_disp = tier_log
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "missing".to_string());
 
     let server = match Server::http(&bind) {
         Ok(s) => s,
@@ -83,33 +97,40 @@ fn main() {
     let ts = rfc3339_utc(unix_now().as_secs() as i64);
     if db.is_some() {
         eprintln!(
-            "collector listening on {bind}, archive {}, db {db_disp} (engine {engine_disp})",
+            "collector listening on {bind}, archive {}, db {db_disp} (engine {engine_disp}), tier_log={tier_log_disp}",
             archive_dir.display()
         );
     } else {
         eprintln!(
-            "collector listening on {bind}, archive {} (archive-only, no db)",
+            "collector listening on {bind}, archive {} (archive-only, no db), tier_log={tier_log_disp}",
             archive_dir.display()
         );
     }
-    append_startup_log(&archive_dir, &ts, &bind, &db_disp, engine_disp);
+    append_startup_log(&archive_dir, &ts, &bind, &db_disp, engine_disp, &tier_log_disp);
 
     // Accept loop on the main thread; handle each request inline (no per-request
     // threads — see the module doc comment).
     for request in server.incoming_requests() {
-        handle(request, &archive_dir, db.as_ref(), &db_token);
+        handle(request, &archive_dir, db.as_ref(), &db_token, tier_log.as_deref());
     }
 }
 
 /// Append one startup marker to `<archive-dir>/_startup.log`, creating the dir
 /// and file as needed. Best-effort: a failure is logged to stderr, not fatal.
-fn append_startup_log(archive_dir: &Path, ts: &str, bind: &str, db: &str, engine: &str) {
+fn append_startup_log(
+    archive_dir: &Path,
+    ts: &str,
+    bind: &str,
+    db: &str,
+    engine: &str,
+    tier_log: &str,
+) {
     if let Err(e) = std::fs::create_dir_all(archive_dir) {
         eprintln!("warning: could not create archive dir for _startup.log: {e}");
         return;
     }
     let line = format!(
-        "{ts} bind={bind} archive={} db={db} engine={engine}\n",
+        "{ts} bind={bind} archive={} db={db} engine={engine} tier_log={tier_log}\n",
         archive_dir.display()
     );
     let res = std::fs::OpenOptions::new()
@@ -125,7 +146,16 @@ fn append_startup_log(archive_dir: &Path, ts: &str, bind: &str, db: &str, engine
 /// Handle one request end to end: route, read (capped), classify, archive,
 /// (optionally) ingest into the db, log, respond. Every path logs exactly one
 /// stdout line (carrying a `db=` token) and sends exactly one response.
-fn handle(mut request: Request, archive_dir: &Path, db: Option<&Db>, db_token: &str) {
+///
+/// Routing: `POST /ingest` is the ingest path (unchanged); GET requests go to
+/// the read endpoints / embedded UI ([`handle_get`]); everything else is 404.
+fn handle(
+    mut request: Request,
+    archive_dir: &Path,
+    db: Option<&Db>,
+    db_token: &str,
+    tier_log: Option<&Path>,
+) {
     let now = unix_now();
     let ts = rfc3339_utc(now.as_secs() as i64);
     let ip = request
@@ -134,9 +164,18 @@ fn handle(mut request: Request, archive_dir: &Path, db: Option<&Db>, db_token: &
         .unwrap_or_else(|| "-".to_string());
 
     // ---- routing ----------------------------------------------------------
-    let path = request.url().split('?').next().unwrap_or("").to_string();
-    let is_ingest = *request.method() == Method::Post && path == "/ingest";
-    if !is_ingest {
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or("").to_string();
+    let query = url.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+    let method = request.method().clone();
+
+    // GET => read endpoints + embedded UI.
+    if method == Method::Get {
+        handle_get(request, &path, &query, db, tier_log, now.as_secs() as i64, &ts, &ip);
+        return;
+    }
+    // Only POST /ingest beyond this point; everything else is 404.
+    if !(method == Method::Post && path == "/ingest") {
         log_line(&ts, &ip, "-", "-", "-", "-", 404, "no route", db_token);
         let _ = request.respond(Response::empty(404));
         return;
@@ -222,6 +261,111 @@ fn handle(mut request: Request, archive_dir: &Path, db: Option<&Db>, db_token: &
     }
 }
 
+/// GET dispatcher: read endpoints (JSON) + embedded UI (static files). Each
+/// arm returns a `Response` with its status code already baked in; the status is
+/// read back off the response for the one log line. The query endpoints require
+/// `--db`; without it they answer 503 (the static UI still serves).
+fn handle_get(
+    request: Request,
+    path: &str,
+    query: &str,
+    db: Option<&Db>,
+    tier_log: Option<&Path>,
+    now_secs: i64,
+    ts: &str,
+    ip: &str,
+) {
+    let resp = match path {
+        "/" => static_response(INDEX_HTML, "text/html; charset=utf-8"),
+        "/app.js" => static_response(APP_JS, "application/javascript; charset=utf-8"),
+        "/style.css" => static_response(STYLE_CSS, "text/css; charset=utf-8"),
+        "/api/leaderboard" => api_leaderboard(db, query, tier_log),
+        "/api/children" => api_children(db, query),
+        "/api/health" => api_health(db, now_secs),
+        _ => json_error("not found", 404),
+    };
+    let status = resp.status_code().0;
+    log_get(ts, ip, path, status);
+    let _ = request.respond(resp);
+}
+
+/// `GET /api/leaderboard`. The tier-log is stat'd per request: an absent file
+/// yields NULL tier columns (not an error), so it is only passed through when it
+/// currently exists.
+fn api_leaderboard(
+    db: Option<&Db>,
+    query: &str,
+    tier_log: Option<&Path>,
+) -> Response<Cursor<Vec<u8>>> {
+    let Some(db) = db else {
+        return json_error("database not enabled", 503);
+    };
+    let knobs = match query::parse_knobs(query) {
+        Ok(k) => k,
+        Err(e) => return json_error(&e, 400),
+    };
+    let tl = tier_log.filter(|p| p.exists());
+    match query::leaderboard(db, &knobs, tl) {
+        Ok(body) => json_response(body, 200),
+        Err(e) => json_error(&format!("db error: {e}"), 500),
+    }
+}
+
+/// `GET /api/children`. `parent` is required (400 if absent).
+fn api_children(db: Option<&Db>, query: &str) -> Response<Cursor<Vec<u8>>> {
+    let Some(db) = db else {
+        return json_error("database not enabled", 503);
+    };
+    let knobs = match query::parse_knobs(query) {
+        Ok(k) => k,
+        Err(e) => return json_error(&e, 400),
+    };
+    if knobs.parent.is_none() {
+        return json_error("parent is required", 400);
+    }
+    match query::children(db, &knobs) {
+        Ok(body) => json_response(body, 200),
+        Err(e) => json_error(&format!("db error: {e}"), 500),
+    }
+}
+
+/// `GET /api/health`.
+fn api_health(db: Option<&Db>, now_secs: i64) -> Response<Cursor<Vec<u8>>> {
+    let Some(db) = db else {
+        return json_error("database not enabled", 503);
+    };
+    match query::health(db, now_secs) {
+        Ok(body) => json_response(body, 200),
+        Err(e) => json_error(&format!("db error: {e}"), 500),
+    }
+}
+
+/// A JSON response with an explicit status and `Content-Type: application/json`.
+fn json_response(body: String, status: u16) -> Response<Cursor<Vec<u8>>> {
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("valid content-type header");
+    Response::from_string(body)
+        .with_status_code(status)
+        .with_header(header)
+}
+
+/// A `{"error": <msg>}` JSON body at the given status (msg is JSON-escaped).
+fn json_error(msg: &str, status: u16) -> Response<Cursor<Vec<u8>>> {
+    json_response(serde_json::json!({ "error": msg }).to_string(), status)
+}
+
+/// A static (embedded) text response with the given content type, status 200.
+fn static_response(body: &'static str, content_type: &str) -> Response<Cursor<Vec<u8>>> {
+    let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+        .expect("valid content-type header");
+    Response::from_string(body).with_header(header)
+}
+
+/// One concise stdout line per GET request (greppable, same `key=` style).
+fn log_get(ts: &str, ip: &str, path: &str, status: u16) {
+    println!("{ts} ip={ip} method=GET path={path} status={status}");
+}
+
 /// Pull the loggable identity (server, run_id[..8], dump_seq) from a
 /// disposition. `Malformed` has no trusted identity, so all three are `"-"`.
 fn log_identity(d: &Disposition) -> (String, String, String) {
@@ -277,6 +421,13 @@ fn parse_db(args: &[String]) -> Option<PathBuf> {
     parse_value(args, "--db").map(PathBuf::from)
 }
 
+/// Parse `--tier-log <path>`; OPTIONAL. Absent => no tier annotations. The path
+/// is NOT required to exist at startup: it is stat'd per query (an absent file
+/// yields NULL tier columns rather than an error).
+fn parse_tier_log(args: &[String]) -> Option<PathBuf> {
+    parse_value(args, "--tier-log").map(PathBuf::from)
+}
+
 /// Find `<flag> <value>` in args, returning the value. A flag with no following
 /// value aborts with exit code 2, matching the agent's `--share` style.
 fn parse_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -308,7 +459,7 @@ fn unix_now() -> std::time::Duration {
 /// Format unix `secs` as RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`). Hand-rolled from
 /// `SystemTime` so the crate needs no date library — the only timestamps we
 /// produce are log lines and the `_malformed` filename (which uses millis).
-fn rfc3339_utc(secs: i64) -> String {
+pub(crate) fn rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
