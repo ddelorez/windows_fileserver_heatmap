@@ -57,10 +57,28 @@ function setStatus(msg) { $("#status").textContent = msg || ""; }
 
 // ---- color ramp -----------------------------------------------------------
 
-// Sequential green -> yellow -> red, low metric = green. t in [0,1].
+// Sequential low->high heatmap, low metric = green. t in [0,1] (the caller's
+// min..max normalization is unchanged). Refined, slightly muted green -> gold ->
+// brick-red tones rather than neon HSL — comfortable on the dark slate bg and
+// still legible on light. Interpolated in RGB across three stops.
+const RAMP_STOPS = [
+  [0.0, [76, 170, 112]],  // muted green  (low / cool)
+  [0.5, [214, 166, 78]],  // gold / amber (mid)
+  [1.0, [206, 84, 78]],   // brick red    (high / hot)
+];
 function ramp(t) {
-  const h = 120 * (1 - Math.max(0, Math.min(1, t)));
-  return "hsl(" + h.toFixed(0) + ", 70%, 55%)";
+  t = Math.max(0, Math.min(1, t));
+  let a = RAMP_STOPS[0], b = RAMP_STOPS[RAMP_STOPS.length - 1];
+  for (let i = 0; i < RAMP_STOPS.length - 1; i++) {
+    if (t >= RAMP_STOPS[i][0] && t <= RAMP_STOPS[i + 1][0]) {
+      a = RAMP_STOPS[i];
+      b = RAMP_STOPS[i + 1];
+      break;
+    }
+  }
+  const f = (t - a[0]) / ((b[0] - a[0]) || 1);
+  const c = a[1].map((av, i) => Math.round(av + (b[1][i] - av) * f));
+  return "rgb(" + c[0] + ", " + c[1] + ", " + c[2] + ")";
 }
 
 // ---- controls -------------------------------------------------------------
@@ -363,6 +381,20 @@ function renderCrumbs() {
 }
 
 // ---- wiring ---------------------------------------------------------------
+
+// Light/dark toggle: flip the root data-theme for the session (no persistence).
+// Bar fill colors are theme-independent; label readability flips via CSS vars,
+// so no re-render is needed.
+function applyThemeLabel() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  $("#theme-toggle").textContent = dark ? "☀ Light" : "🌙 Dark";
+}
+$("#theme-toggle").addEventListener("click", () => {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  applyThemeLabel();
+});
+applyThemeLabel();
 
 $("#controls").addEventListener("submit", (e) => { e.preventDefault(); reload(); });
 
