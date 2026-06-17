@@ -9,25 +9,66 @@
 <body>
   <header>
     <h1>heat-spike</h1>
+    <span id="updated" class="updated"></span>
     <div id="health" class="health-strip">loading health…</div>
   </header>
 
-  <form id="knobs" class="knob-bar" autocomplete="off">
-    <label>w_read <input name="w_read" type="number" step="0.1" value="1.0"></label>
-    <label>w_write <input name="w_write" type="number" step="0.1" value="2.0"></label>
-    <label>window <input name="window" type="number" value="30"></label>
-    <label>min_span <input name="min_span" type="number" value="3"></label>
-    <label>depth <input name="depth" type="number" value="1"></label>
-    <label>limit <input name="limit" type="number" value="50"></label>
-    <label>server <input name="server" type="text" placeholder="(all)"></label>
-    <label>share <input name="share" type="text" placeholder="(all)"></label>
-    <button type="submit">apply</button>
+  <form id="controls" class="controls" autocomplete="off">
+    <label class="ctl">Window
+      <select name="window">
+        <option value="30" selected>30 days</option>
+        <option value="60">60 days</option>
+        <option value="90">90 days</option>
+      </select>
+    </label>
+
+    <label class="ctl">Granularity
+      <select name="depth">
+        <option value="1" selected>Top-level folders</option>
+        <option value="2">One level deeper</option>
+      </select>
+    </label>
+
+    <div class="ctl">View
+      <div class="segmented" id="view-toggle">
+        <button type="button" data-view="chart" class="active">Chart</button>
+        <button type="button" data-view="table">Table</button>
+      </div>
+    </div>
+
+    <button type="submit" class="apply">Apply</button>
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="adv-grid">
+        <label class="ctl">Sort by
+          <select name="_sort">
+            <option value="demand" selected>Demand</option>
+            <option value="density">Density</option>
+          </select>
+        </label>
+        <label class="ctl">w_read <input name="w_read" type="number" step="0.1" value="1.0"></label>
+        <label class="ctl">w_write <input name="w_write" type="number" step="0.1" value="2.0"></label>
+        <label class="ctl">min_span
+          <input name="min_span" type="number" value="1">
+          <span class="hint">burst filter; 3 is the steady-state target once multi-day data accrues</span>
+        </label>
+        <label class="ctl">server <input name="server" type="text" placeholder="(all)"></label>
+        <label class="ctl">share <input name="share" type="text" placeholder="(all)"></label>
+        <label class="ctl">limit <input name="limit" type="number" value="50"></label>
+      </div>
+    </details>
   </form>
 
   <nav id="crumbs" class="crumbs"></nav>
   <div id="status" class="status"></div>
   <div id="meta" class="meta"></div>
-  <table id="table">
+
+  <!-- Primary view: horizontal heat bars -->
+  <div id="chart" class="chart"></div>
+
+  <!-- Secondary view: raw table (hidden unless toggled) -->
+  <table id="table" class="hidden">
     <thead></thead>
     <tbody></tbody>
   </table>
