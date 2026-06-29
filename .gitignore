@@ -9,3 +9,6 @@ target/
 *.pdb
 archive/
 *.duckdb
+
+# Local investigation notes (not part of the codebase)
+troubleshooting/
