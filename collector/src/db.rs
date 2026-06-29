@@ -182,27 +182,59 @@ impl Db {
         }
 
         // --- 2 + 3. per-row dimension + facts -------------------------------
-        for row in rows {
-            let file_id = upsert_dimension(&tx, &header.server, row, ts)?;
-
+        // Statements are prepared ONCE here and reused for every row, instead of
+        // being rebuilt ad-hoc each iteration (~3 prepares/row over ~110k rows).
+        // Behavior is unchanged — identical SQL, identical upsert semantics, one
+        // transaction; this removes only the per-row prepare cost. Scoped in a
+        // block so the borrows on `tx` end before the commit below.
+        {
+            let mut sel_file = tx.prepare(
+                "SELECT file_id FROM files WHERE server = ? AND share = ? AND path = ?",
+            )?;
+            let mut upd_file = tx.prepare(
+                "UPDATE files
+                    SET alloc_bytes = ?, restat = ?, unresolved_share = ?,
+                        last_seen = CAST(? AS TIMESTAMP)
+                  WHERE file_id = ?",
+            )?;
+            let mut ins_file = tx.prepare(
+                "INSERT INTO files
+                     (server, share, path, alloc_bytes, restat, unresolved_share,
+                      first_seen, last_seen)
+                 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))
+                 RETURNING file_id",
+            )?;
             // Facts upsert — the §14 ON CONFLICT spelling, applied verbatim.
-            // reads/writes are u32 in the wire format; bound as i64 (always
-            // non-negative, never truncates) and narrowed to the INTEGER column
-            // by DuckDB (a pathological >2^31 count errors loudly rather than
-            // wrapping). day_index is the agent's i32, bound verbatim.
-            tx.execute(
+            let mut ins_day = tx.prepare(
                 "INSERT INTO day_counts (file_id, run_id, day_index, reads, writes)
                  VALUES (?, CAST(? AS UUID), ?, ?, ?)
                  ON CONFLICT (file_id, run_id, day_index)
                  DO UPDATE SET reads = excluded.reads, writes = excluded.writes",
-                params![
+            )?;
+
+            for row in rows {
+                let file_id = upsert_dimension(
+                    &mut sel_file,
+                    &mut upd_file,
+                    &mut ins_file,
+                    &header.server,
+                    row,
+                    ts,
+                )?;
+
+                // reads/writes are u32 in the wire format; bound as i64 (always
+                // non-negative, never truncates) and narrowed to the INTEGER
+                // column by DuckDB (a pathological >2^31 count errors loudly
+                // rather than wrapping). day_index is the agent's i32, bound
+                // verbatim.
+                ins_day.execute(params![
                     file_id,
                     header.run_id,
                     row.day,
                     row.reads as i64,
                     row.writes as i64
-                ],
-            )?;
+                ])?;
+            }
         }
 
         // --- 4. run row -----------------------------------------------------
@@ -235,8 +267,15 @@ impl Db {
 /// Dimension upsert via select-then-insert-or-update (NOT `ON CONFLICT`: `files`
 /// has two uniqueness constraints — the `file_id` PK and the (server,share,path)
 /// UNIQUE — and we need the `file_id` back). Returns the row's `file_id`.
+///
+/// The three statements (`sel_file`/`upd_file`/`ins_file`) are prepared once by
+/// the caller and passed in by `&mut` so they are reused across every row of the
+/// dump — no per-row prepare. The SQL and the select-then-insert-or-update logic
+/// are unchanged; only where the statements are prepared has moved.
 fn upsert_dimension(
-    tx: &duckdb::Connection,
+    sel_file: &mut duckdb::Statement<'_>,
+    upd_file: &mut duckdb::Statement<'_>,
+    ins_file: &mut duckdb::Statement<'_>,
     server: &str,
     row: &DumpRow,
     ts: &str,
@@ -247,12 +286,8 @@ fn upsert_dimension(
     // never approach i64::MAX, so the cast is safe; `None` stays SQL NULL.
     let alloc: Option<i64> = row.alloc_bytes.map(|v| v as i64);
 
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT file_id FROM files WHERE server = ? AND share = ? AND path = ?",
-            params![server, row.share, row.path],
-            |r| r.get(0),
-        )
+    let existing: Option<i64> = sel_file
+        .query_row(params![server, row.share, row.path], |r| r.get(0))
         .optional()?;
 
     match existing {
@@ -262,13 +297,7 @@ fn upsert_dimension(
             // NULL, restat=true) therefore CLOBBERS a previously-known byte
             // count — deliberate; the latest dump is authoritative. first_seen
             // is never touched; last_seen advances to this dump's emitted_at.
-            tx.execute(
-                "UPDATE files
-                    SET alloc_bytes = ?, restat = ?, unresolved_share = ?,
-                        last_seen = CAST(? AS TIMESTAMP)
-                  WHERE file_id = ?",
-                params![alloc, restat, unresolved, ts, file_id],
-            )?;
+            upd_file.execute(params![alloc, restat, unresolved, ts, file_id])?;
             Ok(file_id)
         }
         None => {
@@ -277,12 +306,7 @@ fn upsert_dimension(
             // needed. (INSERT-then-SELECT on the UNIQUE key would be the fallback
             // if RETURNING were unsupported; it is supported here.)
             // first_seen == last_seen == this dump's emitted_at on first sight.
-            let file_id: i64 = tx.query_row(
-                "INSERT INTO files
-                     (server, share, path, alloc_bytes, restat, unresolved_share,
-                      first_seen, last_seen)
-                 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP))
-                 RETURNING file_id",
+            let file_id: i64 = ins_file.query_row(
                 params![server, row.share, row.path, alloc, restat, unresolved, ts, ts],
                 |r| r.get(0),
             )?;

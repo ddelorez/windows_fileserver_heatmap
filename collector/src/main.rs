@@ -182,6 +182,10 @@ fn handle(
     }
 
     // ---- read body, capped at MAX_BODY (read one byte past to detect over) --
+    // Capture the declared Content-Length BEFORE as_reader() borrows the request
+    // mutably (body_length() borrows &self; as_reader() borrows &mut self). Used
+    // by the truncated-upload guard below.
+    let expected_len = request.body_length();
     let mut body = Vec::new();
     if let Err(e) = request
         .as_reader()
@@ -197,6 +201,27 @@ fn handle(
         log_line(&ts, &ip, "-", "-", "-", "-", 400, "body exceeds 256 MiB", db_token);
         let _ = request.respond(Response::from_string("body exceeds 256 MiB").with_status_code(400));
         return;
+    }
+
+    // ---- truncated-upload guard (before classify and before any archive) ---
+    // read_to_end returns Ok on a short socket EOF, so a body shorter than the
+    // client's Content-Length would otherwise be archived under the per-server
+    // path and parsed, surfacing as a misleading "malformed NDJSON" 400. When the
+    // declared length is known and the received length differs, treat it as a
+    // truncated upload: archive the partial body to the _malformed path (it has
+    // no trusted identity) and reject distinctly.
+    if let Some(expected) = expected_len {
+        if body.len() != expected {
+            let reason = format!("truncated upload: received {} of {expected} bytes", body.len());
+            if let Err(e) = archive::write_malformed(archive_dir, now.as_millis(), &body) {
+                log_line(&ts, &ip, "-", "-", "-", "-", 500, &format!("archive failed: {e}"), db_token);
+                let _ = request.respond(Response::from_string("archive write failed").with_status_code(500));
+                return;
+            }
+            log_line(&ts, &ip, "-", "-", "-", "-", 400, &reason, db_token);
+            let _ = request.respond(Response::from_string(reason).with_status_code(400));
+            return;
+        }
     }
 
     // ---- classify (pure) then archive (I/O) -------------------------------
